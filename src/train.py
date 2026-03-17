@@ -4,7 +4,8 @@ Trains both heads jointly:
   - Head 1 (Emergence): MSE loss on predicted vs actual meta share changes
   - Head 2 (Top 8): BCE loss on archetype-tournament placement prediction
 
-Uses temporal split: earlier tournaments for training, later for validation.
+Uses temporal 3-way split: train (60%) / val (20%) / test (20%).
+Val is used for checkpoint selection; test is evaluated only once at the end.
 """
 
 import logging
@@ -30,9 +31,10 @@ from src.config import (
     NUM_EPOCHS,
     NUM_HEADS,
     NUM_HGT_LAYERS,
-    TEMPORAL_SPLIT_RATIO,
     TOP8_LOSS_WEIGHT,
     TOURNAMENTS_PARQUET,
+    TRAIN_SPLIT_RATIO,
+    VAL_SPLIT_RATIO,
     WEIGHT_DECAY,
 )
 from src.model import MTGMetagameHGT
@@ -119,14 +121,39 @@ def _temporal_split(
     tourney_indices: torch.Tensor,
     n_tournaments: int,
 ) -> tuple:
-    """Split samples by temporal order of tournaments.
+    """Split samples by temporal order of tournaments into train/val/test.
 
-    Returns (train_mask, val_mask) boolean tensors.
+    Returns (train_mask, val_mask, test_mask) boolean tensors.
     """
-    split_idx = int(n_tournaments * TEMPORAL_SPLIT_RATIO)
-    train_mask = tourney_indices < split_idx
-    val_mask = tourney_indices >= split_idx
-    return train_mask, val_mask
+    train_end = int(n_tournaments * TRAIN_SPLIT_RATIO)
+    val_end = int(n_tournaments * (TRAIN_SPLIT_RATIO + VAL_SPLIT_RATIO))
+    train_mask = tourney_indices < train_end
+    val_mask = (tourney_indices >= train_end) & (tourney_indices < val_end)
+    test_mask = tourney_indices >= val_end
+    return train_mask, val_mask, test_mask
+
+
+def _evaluate_top8(model, data, node_emb, arch_idx, tourney_idx, labels, mask, criterion):
+    """Evaluate top8 head on a given split. Returns (loss, accuracy, precision, recall, f1)."""
+    probs = model.predict_top8(
+        node_emb["archetype"],
+        node_emb["tournament"],
+        arch_idx[mask],
+        tourney_idx[mask],
+    )
+    loss = criterion(probs, labels[mask])
+    preds = (probs > 0.5).float()
+    split_labels = labels[mask]
+
+    accuracy = (preds == split_labels).float().mean()
+    if split_labels.sum() > 0:
+        precision = (preds * split_labels).sum() / max(preds.sum(), 1)
+        recall = (preds * split_labels).sum() / split_labels.sum()
+        f1 = 2 * precision * recall / max(precision + recall, 1e-8)
+    else:
+        precision = recall = f1 = torch.tensor(0.0)
+
+    return loss, accuracy, precision, recall, f1
 
 
 def train():
@@ -150,9 +177,12 @@ def train():
     log.info(f"  Top8 samples: {len(top8_labels)} ({top8_labels.sum().int()} pos, "
              f"{(1 - top8_labels).sum().int()} neg)")
 
-    # Temporal split for top8 task
-    train_mask, val_mask = _temporal_split(tourney_idx, data["tournament"].x.shape[0])
-    log.info(f"  Train samples: {train_mask.sum()}, Val samples: {val_mask.sum()}")
+    # Temporal 3-way split for top8 task
+    train_mask, val_mask, test_mask = _temporal_split(
+        tourney_idx, data["tournament"].x.shape[0]
+    )
+    log.info(f"  Train samples: {train_mask.sum()}, Val samples: {val_mask.sum()}, "
+             f"Test samples: {test_mask.sum()}")
 
     # Node dimensions
     node_dims = {nt: data[nt].x.shape[1] for nt in data.node_types}
@@ -227,14 +257,10 @@ def train():
                 val_output = model(data)
                 val_emb = val_output["node_embeddings"]
 
-                val_probs = model.predict_top8(
-                    val_emb["archetype"],
-                    val_emb["tournament"],
-                    arch_idx[val_mask],
-                    tourney_idx[val_mask],
+                val_top8_loss, val_acc, _, _, _ = _evaluate_top8(
+                    model, data, val_emb, arch_idx, tourney_idx,
+                    top8_labels, val_mask, top8_criterion,
                 )
-                val_top8_loss = top8_criterion(val_probs, top8_labels[val_mask])
-                val_acc = ((val_probs > 0.5).float() == top8_labels[val_mask]).float().mean()
 
                 val_emergence_loss = emergence_criterion(
                     val_output["emergence_scores"], emergence_targets
@@ -262,9 +288,9 @@ def train():
     log.info(f"\nBest model at epoch {best_epoch} with val_loss={best_val_loss:.4f}")
     log.info(f"Model saved to {MODEL_PATH}")
 
-    # ── Final evaluation ──
+    # ── Final evaluation on held-out TEST set ──
     log.info("\n" + "=" * 60)
-    log.info("Final Evaluation")
+    log.info("Final Evaluation (held-out test set)")
     log.info("=" * 60)
 
     checkpoint = torch.load(MODEL_PATH, weights_only=False)
@@ -281,32 +307,34 @@ def train():
         arch_names = data["archetype"].names
         ranked = sorted(zip(arch_names, scores.tolist()), key=lambda x: -x[1])
         for name, score in ranked:
-            direction = "↑" if score > 0 else "↓"
+            direction = "\u2191" if score > 0 else "\u2193"
             log.info(f"  {direction} {name:25s} {score:+.4f}")
 
-        # Top8 predictions on validation set
-        log.info("\nTop 8 Prediction (validation set):")
-        val_probs = model.predict_top8(
-            node_emb["archetype"],
-            node_emb["tournament"],
-            arch_idx[val_mask],
-            tourney_idx[val_mask],
+        # Top8 predictions on TEST set (never seen during training or checkpoint selection)
+        log.info("\nTop 8 Prediction (TEST set - held out):")
+        test_loss, test_acc, test_prec, test_rec, test_f1 = _evaluate_top8(
+            model, data, node_emb, arch_idx, tourney_idx,
+            top8_labels, test_mask, top8_criterion,
         )
-        val_preds = (val_probs > 0.5).float()
-        val_labels = top8_labels[val_mask]
 
-        accuracy = (val_preds == val_labels).float().mean()
-        if val_labels.sum() > 0:
-            precision = (val_preds * val_labels).sum() / max(val_preds.sum(), 1)
-            recall = (val_preds * val_labels).sum() / val_labels.sum()
-            f1 = 2 * precision * recall / max(precision + recall, 1e-8)
-        else:
-            precision = recall = f1 = torch.tensor(0.0)
+        log.info(f"  Accuracy:  {test_acc:.3f}")
+        log.info(f"  Precision: {test_prec:.3f}")
+        log.info(f"  Recall:    {test_rec:.3f}")
+        log.info(f"  F1 Score:  {test_f1:.3f}")
+        log.info(f"  BCE Loss:  {test_loss:.4f}")
 
-        log.info(f"  Accuracy:  {accuracy:.3f}")
-        log.info(f"  Precision: {precision:.3f}")
-        log.info(f"  Recall:    {recall:.3f}")
-        log.info(f"  F1 Score:  {f1:.3f}")
+        # Also show val set for comparison
+        log.info("\nTop 8 Prediction (validation set - for comparison):")
+        val_loss, val_acc, val_prec, val_rec, val_f1 = _evaluate_top8(
+            model, data, node_emb, arch_idx, tourney_idx,
+            top8_labels, val_mask, top8_criterion,
+        )
+
+        log.info(f"  Accuracy:  {val_acc:.3f}")
+        log.info(f"  Precision: {val_prec:.3f}")
+        log.info(f"  Recall:    {val_rec:.3f}")
+        log.info(f"  F1 Score:  {val_f1:.3f}")
+        log.info(f"  BCE Loss:  {val_loss:.4f}")
 
 
 if __name__ == "__main__":

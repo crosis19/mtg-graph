@@ -28,6 +28,7 @@ This project models the MTG Standard metagame as a heterogeneous graph with four
 | `(card, co_occurrence, card)` | Deck co-occurrence across tournaments |
 | `(archetype, contains, card)` | Decklist inclusion (weighted by avg copies) |
 | `(archetype, counters, archetype)` | Favorable matchup (>55% win rate, directed) |
+| `(archetype, countered_by, archetype)` | Reverse of counters (receives predator info) |
 | `(archetype, top8, tournament)` | Top 8 placement (weighted by slot count) |
 | `(set, printed_in, card)` | Set membership |
 

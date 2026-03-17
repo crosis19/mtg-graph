@@ -59,4 +59,6 @@ WEIGHT_DECAY = float(os.getenv("WEIGHT_DECAY", "0.0001"))
 NUM_EPOCHS = int(os.getenv("NUM_EPOCHS", "100"))
 EMERGENCE_LOSS_WEIGHT = float(os.getenv("EMERGENCE_LOSS_WEIGHT", "1.0"))
 TOP8_LOSS_WEIGHT = float(os.getenv("TOP8_LOSS_WEIGHT", "1.0"))
-TEMPORAL_SPLIT_RATIO = float(os.getenv("TEMPORAL_SPLIT_RATIO", "0.75"))
+TRAIN_SPLIT_RATIO = float(os.getenv("TRAIN_SPLIT_RATIO", "0.6"))
+VAL_SPLIT_RATIO = float(os.getenv("VAL_SPLIT_RATIO", "0.2"))
+# Test split is implicit: 1.0 - TRAIN_SPLIT_RATIO - VAL_SPLIT_RATIO

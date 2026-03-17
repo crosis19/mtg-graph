@@ -15,7 +15,8 @@ Edge types:
   - (card, semantic_synergy, card)      — embedding similarity (distinct text/mechanics)
   - (card, co_occurrence, card)         — deck co-occurrence (how often played together)
   - (archetype, contains, card)         — decklist inclusion
-  - (archetype, counters, archetype)    — favorable matchup (directed)
+  - (archetype, counters, archetype)     — favorable matchup (directed)
+  - (archetype, countered_by, archetype) — reverse: is countered by (directed)
   - (archetype, top8, tournament)       — placed in top 8, weighted by slot count
   - (set, printed_in, card)             — set contains this card
   - (card, from_set, set)               — reverse: card belongs to set
@@ -621,6 +622,12 @@ def build_graph() -> HeteroData:
     counters_idx, counters_w = _build_counters_edges(matchups, arch_name_to_idx)
     data["archetype", "counters", "archetype"].edge_index = counters_idx
     data["archetype", "counters", "archetype"].edge_weight = counters_w
+
+    # ── Countered_by edges (reverse of counters) ──
+    data["archetype", "countered_by", "archetype"].edge_index = torch.stack([
+        counters_idx[1], counters_idx[0]
+    ])
+    data["archetype", "countered_by", "archetype"].edge_weight = counters_w
 
     # ── Top8 edges (archetype -> tournament, weighted by slot count) ──
     top8_idx, top8_w = _build_top8_edges(decklists, arch_name_to_idx, event_id_to_idx)
