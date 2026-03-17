@@ -1,0 +1,120 @@
+{
+  "folders": [
+    {
+      "path": "."
+    }
+  ],
+  "settings": {
+    "python.defaultInterpreterPath": ".venv/Scripts/python",
+    "python.analysis.typeCheckingMode": "basic",
+    "python.analysis.extraPaths": ["src"],
+    "[python]": {
+      "editor.defaultFormatter": "ms-python.black-formatter",
+      "editor.formatOnSave": true
+    },
+    "files.exclude": {
+      "**/__pycache__": true,
+      "**/*.pyc": true,
+      "data/raw/**": true,
+      "data/processed/*.pt": true,
+      "data/embeddings/*.npy": true
+    },
+    "search.exclude": {
+      "data/**": true,
+      "**/*.pt": true,
+      "**/*.npy": true
+    }
+  },
+  "extensions": {
+    "recommendations": [
+      "ms-python.python",
+      "ms-python.vscode-pylance",
+      "ms-python.black-formatter",
+      "charliermarsh.ruff",
+      "ms-toolsai.jupyter",
+      "tamasfe.even-better-toml"
+    ]
+  },
+  "launch": {
+    "version": "0.2.0",
+    "configurations": [
+      {
+        "name": "Phase 1a: Ingest Cards",
+        "type": "debugpy",
+        "request": "launch",
+        "module": "src.ingest_cards",
+        "cwd": "${workspaceFolder}"
+      },
+      {
+        "name": "Phase 1b: Ingest Tournaments",
+        "type": "debugpy",
+        "request": "launch",
+        "module": "src.ingest_tournaments",
+        "cwd": "${workspaceFolder}"
+      },
+      {
+        "name": "Phase 1c: Ingest Metagame",
+        "type": "debugpy",
+        "request": "launch",
+        "module": "src.ingest_metagame",
+        "cwd": "${workspaceFolder}"
+      },
+      {
+        "name": "Phase 1d: Ingest Matchups",
+        "type": "debugpy",
+        "request": "launch",
+        "module": "src.ingest_matchups",
+        "cwd": "${workspaceFolder}"
+      },
+      {
+        "name": "Phase 2a: Keyword Matrix",
+        "type": "debugpy",
+        "request": "launch",
+        "module": "src.keyword_matrix",
+        "cwd": "${workspaceFolder}"
+      },
+      {
+        "name": "Phase 2b: Card Embeddings",
+        "type": "debugpy",
+        "request": "launch",
+        "module": "src.card_embeddings",
+        "cwd": "${workspaceFolder}"
+      },
+      {
+        "name": "Phase 2c: Synergy Eval",
+        "type": "debugpy",
+        "request": "launch",
+        "module": "src.synergy_eval",
+        "cwd": "${workspaceFolder}"
+      },
+      {
+        "name": "Phase 3: Build Graph",
+        "type": "debugpy",
+        "request": "launch",
+        "module": "src.graph_builder",
+        "cwd": "${workspaceFolder}"
+      },
+      {
+        "name": "Phase 4: Train Model",
+        "type": "debugpy",
+        "request": "launch",
+        "module": "src.train",
+        "cwd": "${workspaceFolder}"
+      },
+      {
+        "name": "Phase 5: Visualize",
+        "type": "debugpy",
+        "request": "launch",
+        "module": "src.visualize",
+        "cwd": "${workspaceFolder}"
+      },
+      {
+        "name": "Generate Synthetic Data",
+        "type": "debugpy",
+        "request": "launch",
+        "module": "src.synthetic_data",
+        "cwd": "${workspaceFolder}"
+      }
+    ]
+  }
+}
