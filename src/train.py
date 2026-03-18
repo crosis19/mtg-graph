@@ -8,8 +8,10 @@ Uses temporal 3-way split: train (60%) / val (20%) / test (20%).
 Val is used for checkpoint selection; test is evaluated only once at the end.
 """
 
+import json
 import logging
 import random
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -27,7 +29,6 @@ from src.config import (
     HIDDEN_DIM,
     LEARNING_RATE,
     METAGAME_PARQUET,
-    MODEL_PATH,
     NUM_EPOCHS,
     NUM_HEADS,
     NUM_HGT_LAYERS,
@@ -36,6 +37,7 @@ from src.config import (
     TRAIN_SPLIT_RATIO,
     VAL_SPLIT_RATIO,
     WEIGHT_DECAY,
+    create_run_dir,
 )
 from src.model import MTGMetagameHGT
 
@@ -135,14 +137,14 @@ def _temporal_split(
 
 def _evaluate_top8(model, data, node_emb, arch_idx, tourney_idx, labels, mask, criterion):
     """Evaluate top8 head on a given split. Returns (loss, accuracy, precision, recall, f1)."""
-    probs = model.predict_top8(
+    logits = model.predict_top8(
         node_emb["archetype"],
         node_emb["tournament"],
         arch_idx[mask],
         tourney_idx[mask],
     )
-    loss = criterion(probs, labels[mask])
-    preds = (probs > 0.5).float()
+    loss = criterion(logits, labels[mask])
+    preds = (torch.sigmoid(logits) > 0.5).float()
     split_labels = labels[mask]
 
     accuracy = (preds == split_labels).float().mean()
@@ -156,8 +158,28 @@ def _evaluate_top8(model, data, node_emb, arch_idx, tourney_idx, labels, mask, c
     return loss, accuracy, precision, recall, f1
 
 
-def train():
-    """Main training loop."""
+def train(device=None):
+    """Main training loop.
+
+    Parameters
+    ----------
+    device : torch.device, optional
+        Device to train on (e.g. 'cuda' or 'cpu'). Defaults to CPU.
+
+    Returns
+    -------
+    dict with keys:
+        model, data, train_losses, val_losses, val_accs, best_epoch,
+        arch_idx, tourney_idx, top8_labels, train_mask, val_mask, test_mask
+    """
+    if device is None:
+        device = torch.device("cpu")
+
+    # Create timestamped run directory
+    run_dir = create_run_dir()
+    model_path = run_dir / "model.pt"
+    log.info(f"Results will be saved to {run_dir}")
+
     # Seed for reproducibility
     torch.manual_seed(42)
     random.seed(42)
@@ -169,7 +191,7 @@ def train():
     log.info(f"  Nodes: {', '.join(f'{nt}={data[nt].x.shape[0]}' for nt in data.node_types)}")
     log.info(f"  Edge types: {len(data.edge_types)}")
 
-    # Build targets
+    # Build targets (on CPU first, then move)
     log.info("\nBuilding targets...")
     emergence_targets = _build_emergence_targets(data)
     arch_idx, tourney_idx, top8_labels = _build_top8_samples(data)
@@ -184,6 +206,16 @@ def train():
     log.info(f"  Train samples: {train_mask.sum()}, Val samples: {val_mask.sum()}, "
              f"Test samples: {test_mask.sum()}")
 
+    # Move to device
+    data = data.to(device)
+    emergence_targets = emergence_targets.to(device)
+    arch_idx = arch_idx.to(device)
+    tourney_idx = tourney_idx.to(device)
+    top8_labels = top8_labels.to(device)
+    train_mask = train_mask.to(device)
+    val_mask = val_mask.to(device)
+    test_mask = test_mask.to(device)
+
     # Node dimensions
     node_dims = {nt: data[nt].x.shape[1] for nt in data.node_types}
     log.info(f"\nNode dimensions: {node_dims}")
@@ -196,7 +228,7 @@ def train():
         num_heads=NUM_HEADS,
         num_layers=NUM_HGT_LAYERS,
         dropout=DROPOUT,
-    )
+    ).to(device)
     total_params = sum(p.numel() for p in model.parameters())
     log.info(f"Model parameters: {total_params:,}")
 
@@ -206,11 +238,14 @@ def train():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
 
     emergence_criterion = nn.MSELoss()
-    top8_criterion = nn.BCELoss()
+    top8_criterion = nn.BCEWithLogitsLoss()
 
     # ── Training loop ──
     best_val_loss = float("inf")
     best_epoch = 0
+    train_losses = []
+    val_losses = []
+    val_accs = []
 
     log.info(f"\nTraining for {NUM_EPOCHS} epochs...")
     log.info(f"{'Epoch':>5} {'Train Loss':>10} {'Emrg Loss':>10} {'Top8 Loss':>10} "
@@ -230,13 +265,13 @@ def train():
         )
 
         # Head 2: Top8 loss (train split only)
-        top8_probs = model.predict_top8(
+        top8_logits = model.predict_top8(
             node_emb["archetype"],
             node_emb["tournament"],
             arch_idx[train_mask],
             tourney_idx[train_mask],
         )
-        top8_loss = top8_criterion(top8_probs, top8_labels[train_mask])
+        top8_loss = top8_criterion(top8_logits, top8_labels[train_mask])
 
         # Combined loss
         total_loss = (
@@ -249,6 +284,8 @@ def train():
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         scheduler.step()
+
+        train_losses.append(total_loss.item())
 
         # ── Validation ──
         if epoch % 5 == 0 or epoch == 1:
@@ -267,6 +304,9 @@ def train():
                 )
                 val_loss = val_emergence_loss + val_top8_loss
 
+            val_losses.append(val_loss.item())
+            val_accs.append(val_acc.item())
+
             lr = scheduler.get_last_lr()[0]
             log.info(
                 f"{epoch:5d} {total_loss.item():10.4f} {emergence_loss.item():10.4f} "
@@ -283,19 +323,60 @@ def train():
                     "optimizer_state_dict": optimizer.state_dict(),
                     "val_loss": val_loss.item(),
                     "val_acc": val_acc.item(),
-                }, MODEL_PATH)
+                }, model_path)
 
     log.info(f"\nBest model at epoch {best_epoch} with val_loss={best_val_loss:.4f}")
-    log.info(f"Model saved to {MODEL_PATH}")
+    log.info(f"Model saved to {model_path}")
 
-    # ── Final evaluation on held-out TEST set ──
+    return {
+        "model": model,
+        "data": data,
+        "train_losses": train_losses,
+        "val_losses": val_losses,
+        "val_accs": val_accs,
+        "best_epoch": best_epoch,
+        "arch_idx": arch_idx,
+        "tourney_idx": tourney_idx,
+        "top8_labels": top8_labels,
+        "train_mask": train_mask,
+        "val_mask": val_mask,
+        "test_mask": test_mask,
+        "run_dir": run_dir,
+        "model_path": model_path,
+    }
+
+
+def evaluate(model, data, arch_idx, tourney_idx, top8_labels,
+             val_mask, test_mask, run_dir, model_path,
+             train_losses=None, val_losses=None,
+             val_accs=None, best_epoch=None):
+    """Final evaluation on held-out test set and save training log.
+
+    Parameters
+    ----------
+    All parameters come from the dict returned by train().
+    run_dir : Path
+        Timestamped results directory for this run.
+    model_path : Path
+        Path to the saved model checkpoint.
+    train_losses, val_losses, val_accs, best_epoch : optional
+        Pass these from train() return dict to include epoch-level
+        metrics in the saved training log.
+
+    Returns
+    -------
+    dict with test and val metrics.
+    """
+    top8_criterion = nn.BCEWithLogitsLoss()
+    emergence_criterion = nn.MSELoss()
+
+    checkpoint = torch.load(model_path, weights_only=False)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+
     log.info("\n" + "=" * 60)
     log.info("Final Evaluation (held-out test set)")
     log.info("=" * 60)
-
-    checkpoint = torch.load(MODEL_PATH, weights_only=False)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval()
 
     with torch.no_grad():
         output = model(data)
@@ -305,10 +386,12 @@ def train():
         log.info("\nArchetype Emergence Predictions (predicted share change):")
         scores = output["emergence_scores"]
         arch_names = data["archetype"].names
-        ranked = sorted(zip(arch_names, scores.tolist()), key=lambda x: -x[1])
+        ranked = sorted(zip(arch_names, scores.cpu().tolist()), key=lambda x: -x[1])
+        emergence_rankings = []
         for name, score in ranked:
             direction = "\u2191" if score > 0 else "\u2193"
             log.info(f"  {direction} {name:25s} {score:+.4f}")
+            emergence_rankings.append({"archetype": name, "predicted_change": score})
 
         # Top8 predictions on TEST set (never seen during training or checkpoint selection)
         log.info("\nTop 8 Prediction (TEST set - held out):")
@@ -336,6 +419,84 @@ def train():
         log.info(f"  F1 Score:  {val_f1:.3f}")
         log.info(f"  BCE Loss:  {val_loss:.4f}")
 
+    # ── Save training log ──
+    results = {
+        "test": {
+            "accuracy": float(test_acc),
+            "precision": float(test_prec),
+            "recall": float(test_rec),
+            "f1": float(test_f1),
+            "bce_loss": float(test_loss),
+        },
+        "val": {
+            "accuracy": float(val_acc),
+            "precision": float(val_prec),
+            "recall": float(val_rec),
+            "f1": float(val_f1),
+            "bce_loss": float(val_loss),
+        },
+    }
+
+    training_log = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "hyperparameters": {
+            "hidden_dim": HIDDEN_DIM,
+            "num_heads": NUM_HEADS,
+            "num_hgt_layers": NUM_HGT_LAYERS,
+            "dropout": DROPOUT,
+            "learning_rate": LEARNING_RATE,
+            "weight_decay": WEIGHT_DECAY,
+            "num_epochs": NUM_EPOCHS,
+            "emergence_loss_weight": EMERGENCE_LOSS_WEIGHT,
+            "top8_loss_weight": TOP8_LOSS_WEIGHT,
+            "train_split": TRAIN_SPLIT_RATIO,
+            "val_split": VAL_SPLIT_RATIO,
+            "test_split": round(1.0 - TRAIN_SPLIT_RATIO - VAL_SPLIT_RATIO, 2),
+        },
+        "graph_info": {
+            "node_types": {nt: data[nt].x.shape[0] for nt in data.node_types},
+            "edge_types": len(data.edge_types),
+            "num_archetypes": len(arch_names),
+        },
+        "data_split": {
+            "total_top8_samples": int(top8_labels.shape[0]),
+            "positive_samples": int(top8_labels.sum()),
+            "negative_samples": int(top8_labels.shape[0] - int(top8_labels.sum())),
+        },
+        "training_curves": {
+            "train_losses": train_losses or [],
+            "val_losses": val_losses or [],
+            "val_accs": val_accs or [],
+        },
+        "best_epoch": best_epoch,
+        "final_metrics": results,
+        "emergence_rankings": emergence_rankings,
+        "model_path": str(model_path),
+        "run_dir": str(run_dir),
+    }
+
+    log_path = run_dir / "training_log.json"
+    with open(log_path, "w") as f:
+        json.dump(training_log, f, indent=2)
+    log.info(f"\nTraining log saved to {log_path}")
+
+    return results
+
 
 if __name__ == "__main__":
-    train()
+    result = train()
+    evaluate(
+        model=result["model"],
+        data=result["data"],
+        arch_idx=result["arch_idx"],
+        tourney_idx=result["tourney_idx"],
+        top8_labels=result["top8_labels"],
+        val_mask=result["val_mask"],
+        test_mask=result["test_mask"],
+        run_dir=result["run_dir"],
+        model_path=result["model_path"],
+        train_losses=result["train_losses"],
+        val_losses=result["val_losses"],
+        val_accs=result["val_accs"],
+        best_epoch=result["best_epoch"],
+    )

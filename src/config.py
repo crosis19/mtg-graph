@@ -1,6 +1,7 @@
 """Project-wide paths and constants."""
 
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -11,6 +12,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_RAW = PROJECT_ROOT / "data" / "raw"
 DATA_PROCESSED = PROJECT_ROOT / "data" / "processed"
 DATA_EMBEDDINGS = PROJECT_ROOT / "data" / "embeddings"
+RESULTS_DIR = PROJECT_ROOT / "results"
 
 # Scryfall
 SCRYFALL_BULK_URL = os.getenv("SCRYFALL_BULK_URL", "https://api.scryfall.com/bulk-data")
@@ -47,7 +49,6 @@ COUNTERS_WIN_RATE_THRESHOLD = float(os.getenv("COUNTERS_WIN_RATE_THRESHOLD", "55
 CO_OCCURRENCE_MIN_DECKS = int(os.getenv("CO_OCCURRENCE_MIN_DECKS", "2"))
 
 # Model architecture
-MODEL_PATH = DATA_PROCESSED / "model.pt"
 HIDDEN_DIM = int(os.getenv("HIDDEN_DIM", "128"))
 NUM_HEADS = int(os.getenv("NUM_HEADS", "4"))
 NUM_HGT_LAYERS = int(os.getenv("NUM_HGT_LAYERS", "3"))
@@ -62,3 +63,19 @@ TOP8_LOSS_WEIGHT = float(os.getenv("TOP8_LOSS_WEIGHT", "1.0"))
 TRAIN_SPLIT_RATIO = float(os.getenv("TRAIN_SPLIT_RATIO", "0.6"))
 VAL_SPLIT_RATIO = float(os.getenv("VAL_SPLIT_RATIO", "0.2"))
 # Test split is implicit: 1.0 - TRAIN_SPLIT_RATIO - VAL_SPLIT_RATIO
+
+# Results — each run gets a timestamped subfolder
+def create_run_dir() -> Path:
+    """Create and return a timestamped results directory for this training run."""
+    run_name = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
+    run_dir = RESULTS_DIR / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    # Symlink 'latest' for easy access
+    latest = RESULTS_DIR / "latest"
+    if latest.is_symlink() or latest.exists():
+        latest.unlink()
+    try:
+        latest.symlink_to(run_dir.name)
+    except OSError:
+        pass  # Symlinks may not work on all platforms (e.g., Windows without admin)
+    return run_dir

@@ -22,14 +22,18 @@ data/processed/
 data/embeddings/
 
 # Binary model/embedding artifacts
-*.pt
-*.pth
 *.npy
 *.npz
 
-# Generated HTML output
+# Generated HTML output (old location)
 mtg_dashboard.html
 mtg_metagame_graph_synergy_types.html
+
+# Results — each run creates a timestamped folder
+# Keep the directory structure but exclude large/generated files
+results/*/model.pt
+results/*/dashboard.html
+results/latest
 
 # Project plan doc (not committed)
 *.docx

@@ -86,13 +86,13 @@ class MTGMetagameHGT(nn.Module):
         )
 
         # ── Head 2: Tournament Top 8 ──
-        # Given (archetype_emb, tournament_emb) → probability of top 8 placement
+        # Given (archetype_emb, tournament_emb) → raw logit for top 8 placement
+        # NOTE: No sigmoid here — use BCEWithLogitsLoss for numerical stability
         self.top8_head = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
-            nn.Sigmoid(),
         )
 
     def forward(self, data: HeteroData) -> dict:
@@ -150,7 +150,7 @@ class MTGMetagameHGT(nn.Module):
 
         Returns
         -------
-        probs : (n_pairs,) probability of top 8 placement
+        logits : (n_pairs,) raw logits — apply sigmoid for probabilities
         """
         arch_emb = arch_embeddings[arch_indices]
         tourney_emb = tourney_embeddings[tourney_indices]

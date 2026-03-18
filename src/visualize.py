@@ -18,20 +18,18 @@ import pandas as pd
 import torch
 
 from src.config import (
-    DATA_PROCESSED,
     CARDS_PARQUET,
+    GRAPH_PATH,
     METAGAME_PARQUET,
+    RESULTS_DIR,
     TOURNAMENTS_PARQUET,
     DECKLISTS_PARQUET,
+    create_run_dir,
 )
 from src.model import MTGMetagameHGT
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
-
-GRAPH_PATH = DATA_PROCESSED / "graph.pt"
-MODEL_PATH = DATA_PROCESSED / "model.pt"
-OUTPUT_HTML = Path(__file__).resolve().parent.parent / "mtg_dashboard.html"
 
 
 def _get_top_cards_per_archetype(data, decklists: pd.DataFrame, top_n: int = 5) -> dict:
@@ -50,8 +48,14 @@ def _get_top_cards_per_archetype(data, decklists: pd.DataFrame, top_n: int = 5) 
     return result
 
 
-def _get_model_predictions(data) -> dict:
-    """Run inference and get predictions."""
+def _get_model_predictions(data, model_path=None) -> dict:
+    """Run inference and get predictions.
+
+    Parameters
+    ----------
+    model_path : Path, optional
+        Path to model checkpoint. If None, uses latest run dir.
+    """
     node_dims = {nt: data[nt].x.shape[1] for nt in data.node_types}
 
     model = MTGMetagameHGT(
@@ -63,7 +67,10 @@ def _get_model_predictions(data) -> dict:
         dropout=0.0,
     )
 
-    checkpoint = torch.load(MODEL_PATH, weights_only=False)
+    if model_path is None:
+        latest = RESULTS_DIR / "latest" / "model.pt"
+        model_path = latest
+    checkpoint = torch.load(model_path, weights_only=False)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
@@ -751,12 +758,26 @@ def generate_html(graph_data: dict, predictions: dict) -> str:
     return html
 
 
-def main():
+def main(run_dir=None, model_path=None):
+    """Generate dashboard and save to the run directory.
+
+    Parameters
+    ----------
+    run_dir : Path, optional
+        Results directory for this run. If None, uses 'results/latest'.
+    model_path : Path, optional
+        Path to model checkpoint. If None, uses run_dir/model.pt.
+    """
+    if run_dir is None:
+        run_dir = RESULTS_DIR / "latest"
+    if model_path is None:
+        model_path = run_dir / "model.pt"
+
     log.info("Loading graph and model...")
     data = torch.load(GRAPH_PATH, weights_only=False)
 
     log.info("Getting model predictions...")
-    predictions = _get_model_predictions(data)
+    predictions = _get_model_predictions(data, model_path=model_path)
 
     log.info("Building archetype card pools...")
     try:
@@ -772,9 +793,12 @@ def main():
     log.info("Generating HTML dashboard...")
     html = generate_html(graph_data, predictions)
 
-    OUTPUT_HTML.write_text(html, encoding="utf-8")
-    log.info(f"Dashboard saved to {OUTPUT_HTML}")
-    log.info(f"Open in browser: file:///{OUTPUT_HTML.as_posix()}")
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    dashboard_path = run_dir / "dashboard.html"
+    dashboard_path.write_text(html, encoding="utf-8")
+    log.info(f"Dashboard saved to {dashboard_path}")
+    log.info(f"Open in browser: file:///{dashboard_path.as_posix()}")
 
 
 if __name__ == "__main__":
