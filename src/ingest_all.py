@@ -22,7 +22,6 @@ import pandas as pd
 from src.config import (
     CARDS_PARQUET,
     CARD_EMBEDDINGS_PATH,
-    CO_OCCURRENCE_EDGES_PATH,
     DECKLISTS_PARQUET,
     GRAPH_PATH,
     KEYWORD_MATRIX_PATH,
@@ -30,7 +29,6 @@ from src.config import (
     MECHANICAL_EDGES_PATH,
     METAGAME_PARQUET,
     SEMANTIC_EDGES_PATH,
-    TOURNAMENTS_PARQUET,
 )
 
 logging.basicConfig(
@@ -86,22 +84,6 @@ def _validate_cards(df: pd.DataFrame):
         type_counts = df["type_line"].str.split(" — ").str[0].value_counts().head(5)
         log.info(f"    Top card types: {dict(type_counts)}")
 
-
-def _validate_tournaments(t_df: pd.DataFrame, d_df: pd.DataFrame):
-    """Tournament + decklist cross-validation."""
-    if t_df is None or d_df is None:
-        return
-    log.info(f"    Unique events: {t_df['event_id'].nunique()}")
-    if "date" in t_df.columns:
-        log.info(f"    Date range: {t_df['date'].min()} to {t_df['date'].max()}")
-
-    if d_df is not None and not d_df.empty:
-        log.info(f"    Unique archetypes in decklists: {d_df['archetype'].nunique()}")
-        # Check for events in decklists not in tournaments
-        if "event_id" in d_df.columns and "event_id" in t_df.columns:
-            orphan_events = set(d_df["event_id"]) - set(t_df["event_id"])
-            if orphan_events:
-                log.warning(f"    WARNING: {len(orphan_events)} decklist events not in tournaments")
 
 
 def _validate_metagame(df: pd.DataFrame):
@@ -164,7 +146,7 @@ def _validate_graph():
         n_edges = ei.shape[1]
 
         if n_edges == 0:
-            problems.append(f"    WARNING: ({src_type}, {rel}, {dst_type}) has 0 edges")
+            log.warning(f"    WARNING: ({src_type}, {rel}, {dst_type}) has 0 edges")
             continue
 
         log.info(f"    ({src_type}, {rel}, {dst_type}): {n_edges:,} edges")
@@ -201,32 +183,27 @@ def run_phase1():
     log.info("=" * 70)
 
     # Step 1: Cards
-    log.info("\n── Step 1/4: Scryfall Cards ──")
+    log.info("\n── Step 1/3: Scryfall Cards ──")
     from src.ingest_cards import run as ingest_cards
 
-    cards_df = ingest_cards()
+    ingest_cards()
     cards_df = _validate_parquet(CARDS_PARQUET, "cards", ["name", "type_line"])
     _validate_cards(cards_df)
 
-    # Step 2: Tournaments
-    log.info("\n── Step 2/4: Tournament Results ──")
-    from src.ingest_tournaments import run as ingest_tournaments
-
-    ingest_tournaments()
-    t_df = _validate_parquet(TOURNAMENTS_PARQUET, "tournaments", ["event_id", "date"])
-    d_df = _validate_parquet(DECKLISTS_PARQUET, "decklists", ["event_id", "archetype", "card_name"])
-    _validate_tournaments(t_df, d_df)
-
-    # Step 3: Metagame
-    log.info("\n── Step 3/4: Metagame Snapshots ──")
+    # Step 2: Metagame + Decklists (MTGGoldfish)
+    log.info("\n── Step 2/3: MTGGoldfish Metagame + Decklists ──")
     from src.ingest_metagame import run as ingest_metagame
 
     ingest_metagame()
     meta_df = _validate_parquet(METAGAME_PARQUET, "metagame", ["archetype", "meta_share_pct"])
     _validate_metagame(meta_df)
+    d_df = _validate_parquet(DECKLISTS_PARQUET, "decklists", ["archetype", "card_name", "board"])
+    if d_df is not None and not d_df.empty:
+        log.info(f"    Unique archetypes in decklists: {d_df['archetype'].nunique()}")
+        log.info(f"    Unique cards in decklists: {d_df['card_name'].nunique()}")
 
-    # Step 4: Matchups
-    log.info("\n── Step 4/4: Archetype Matchups ──")
+    # Step 3: Matchups (MTGDecks)
+    log.info("\n── Step 3/3: Archetype Matchups ──")
     from src.ingest_matchups import run as ingest_matchups
 
     ingest_matchups()
@@ -252,15 +229,6 @@ def run_phase1():
         log.info(f"  Total unique archetypes across sources: {len(all_archs)}")
         for src_name, archs in arch_sources.items():
             log.info(f"    {src_name}: {len(archs)} archetypes")
-
-        # Find archetypes in decklists but not in metagame (potential mapping issues)
-        if "decklists" in arch_sources and "metagame" in arch_sources:
-            deck_only = arch_sources["decklists"] - arch_sources["metagame"]
-            if deck_only:
-                log.warning(
-                    f"  WARNING: {len(deck_only)} archetypes in decklists but not metagame: "
-                    f"{sorted(deck_only)[:10]}"
-                )
 
 
 def run_phase2():
@@ -318,7 +286,7 @@ def run_phase3():
 
     if valid:
         log.info("\n  Graph is ready for training!")
-        log.info(f"  Run: python -m src.train")
+        log.info(f"  Run: python -m src.train_deck")
     else:
         log.error("\n  Graph has problems — inspect and fix before training.")
         sys.exit(1)
@@ -333,14 +301,12 @@ def print_summary():
 
     outputs = [
         ("Cards", CARDS_PARQUET),
-        ("Tournaments", TOURNAMENTS_PARQUET),
-        ("Decklists", DECKLISTS_PARQUET),
         ("Metagame", METAGAME_PARQUET),
+        ("Decklists", DECKLISTS_PARQUET),
         ("Matchups", MATCHUPS_PARQUET),
         ("Keyword Synergy", KEYWORD_MATRIX_PATH),
         ("Mechanical Synergy", MECHANICAL_EDGES_PATH),
         ("Semantic Synergy", SEMANTIC_EDGES_PATH),
-        ("Co-occurrence", CO_OCCURRENCE_EDGES_PATH),
         ("Graph", GRAPH_PATH),
     ]
 
@@ -391,11 +357,9 @@ def main():
         log.info("\n── Phase 1 Outputs ──")
         cards = _validate_parquet(CARDS_PARQUET, "cards", ["name", "type_line"])
         _validate_cards(cards)
-        t_df = _validate_parquet(TOURNAMENTS_PARQUET, "tournaments", ["event_id", "date"])
-        d_df = _validate_parquet(DECKLISTS_PARQUET, "decklists", ["event_id", "archetype"])
-        _validate_tournaments(t_df, d_df)
         meta = _validate_parquet(METAGAME_PARQUET, "metagame", ["archetype", "meta_share_pct"])
         _validate_metagame(meta)
+        d_df = _validate_parquet(DECKLISTS_PARQUET, "decklists", ["archetype", "card_name", "board"])
         matchups = _validate_parquet(MATCHUPS_PARQUET, "matchups", ["archetype_a", "archetype_b"])
         _validate_matchups(matchups)
         log.info("\n── Phase 2 Outputs ──")

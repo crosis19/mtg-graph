@@ -25,18 +25,21 @@ data/embeddings/
 *.npy
 *.npz
 
-# Generated HTML output (old location)
-mtg_dashboard.html
-mtg_metagame_graph_synergy_types.html
-
 # Results — each run creates a timestamped folder
 # Keep the directory structure but exclude large/generated files
 results/*/model.pt
 results/*/dashboard.html
 results/latest
+results/*/latest
+results/*/*/model.pt
+results/*/*/dashboard.html
 
 # Project plan doc (not committed)
 *.docx
+
+# Generated HTML
+*.html
+!results/**/*.html
 
 # IDE
 .vscode/

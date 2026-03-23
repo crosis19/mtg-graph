@@ -1,12 +1,20 @@
-"""Phase 1: Scrape weekly metagame snapshots from MTGGoldfish.
+"""Phase 1: Scrape metagame snapshots and decklists from MTGGoldfish.
 
-Collects archetype-level data:
-- Meta share percentage per archetype per week
-- Win rate (where available)
-- Trend direction (rising/falling/stable)
-- Color identity per archetype
+Collects:
+  - Archetype-level metagame data (share %, deck count, color identity)
+  - Per-card decklists for archetypes above the meta share threshold
 
-Outputs: metagame.parquet
+Uses https://www.mtggoldfish.com/metagame/standard#paper which defaults to
+30-day paper metagame data. Each archetype tile links to an archetype page
+with a "Card Breakdown" section showing average copies and inclusion rate
+per card, split by mainboard/sideboard.
+
+Fallback: If Card Breakdown parsing fails, downloads the text decklist
+from the /deck/download/ endpoint.
+
+Outputs:
+  - metagame.parquet  (archetype-level stats)
+  - decklists.parquet (per-card data for eligible archetypes)
 """
 
 import logging
@@ -18,13 +26,20 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
-from src.config import METAGAME_PARQUET, DATA_PROCESSED, SCRAPE_DELAY
+from src.config import (
+    DATA_PROCESSED,
+    DECKLISTS_PARQUET,
+    DECK_MIN_META_SHARE,
+    METAGAME_PARQUET,
+    SCRAPE_DELAY,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 GOLDFISH_BASE = "https://www.mtggoldfish.com"
-METAGAME_URL = f"{GOLDFISH_BASE}/metagame/standard/full"
+# Use the standard page (not /full) — defaults to 30-day view with top archetypes
+METAGAME_URL = f"{GOLDFISH_BASE}/metagame/standard"
 
 HEADERS = {
     "User-Agent": "MTG-Graph-Research/1.0 (academic project; respectful scraping)",
@@ -43,6 +58,7 @@ COLOR_MAP = {
     "Abzan": "WBG", "Jeskai": "WUR", "Sultai": "UBG",
     "Mardu": "WBR", "Temur": "URG",
     "Domain": "WUBRG", "5c": "WUBRG", "Five-Color": "WUBRG",
+    "4c": "WUBR", "4C": "WUBR",
 }
 
 
@@ -54,52 +70,78 @@ def infer_color_identity(archetype_name: str) -> str:
     return ""
 
 
-def scrape_current_metagame() -> list[dict]:
-    """Scrape the current Standard metagame page from MTGGoldfish."""
-    log.info("Fetching metagame from %s", METAGAME_URL)
-
+def _fetch(url: str) -> BeautifulSoup:
+    """Fetch a URL with rate limiting and return parsed soup."""
     time.sleep(SCRAPE_DELAY)
-    resp = requests.get(METAGAME_URL, headers=HEADERS, timeout=30)
+    resp = requests.get(url, headers=HEADERS, timeout=30)
     resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "lxml")
+    return BeautifulSoup(resp.text, "lxml")
+
+
+# ── Metagame page scraper ───────────────────────────────────────────────
+
+
+def scrape_current_metagame() -> list[dict]:
+    """Scrape the current Standard metagame page from MTGGoldfish.
+
+    Parses .archetype-tile elements from the 30-day default view.
+    Extracts archetype names from .archetype-tile-title (not the card image
+    label, which is a key card name, not the archetype name).
+
+    Returns list of dicts with archetype name, meta share, deck count,
+    color identity, and archetype page URL.
+    """
+    log.info("Fetching metagame from %s", METAGAME_URL)
+    soup = _fetch(METAGAME_URL)
 
     snapshot_date = datetime.now().strftime("%Y-%m-%d")
     archetypes = []
+    seen_urls = set()  # deduplicate by archetype URL
 
-    # MTGGoldfish metagame page has tiles/rows for each archetype
-    # Look for the archetype containers
-    tiles = soup.select(
-        ".archetype-tile, .metagame-decks-item, tr.deck-tile, div[class*='archetype']"
-    )
-
+    tiles = soup.select(".archetype-tile")
     if not tiles:
-        # Fallback: look for any structure with percentage data
-        tiles = soup.find_all("div", class_=re.compile(r"archetype|metagame|deck"))
+        log.warning("No .archetype-tile elements found on page")
+        return []
+
+    log.info("Found %d archetype tiles", len(tiles))
 
     for tile in tiles:
-        name_el = tile.select_one(
-            ".deck-price-paper a, .archetype-name a, a[href*='/archetype/'], span.deck-name"
-        )
+        # Get archetype name from the title section (paper version)
+        # This is the real archetype name, NOT the key card displayed as image
+        name_el = tile.select_one(".archetype-tile-title .deck-price-paper a")
         if not name_el:
-            name_el = tile.find("a")
+            # Fallback to any title link
+            name_el = tile.select_one(".archetype-tile-title a")
         if not name_el:
             continue
 
         name = name_el.get_text(strip=True)
+        archetype_url = name_el.get("href", "")
+
         if not name or len(name) < 3:
             continue
 
-        # Find meta share percentage
-        meta_share = None
-        pct_match = re.search(r"([\d.]+)\s*%", tile.get_text())
-        if pct_match:
-            meta_share = float(pct_match.group(1))
+        # Deduplicate: some pages list the same archetype URL twice
+        # (e.g., different card images but same archetype)
+        url_key = archetype_url.split("#")[0]
+        if url_key in seen_urls:
+            continue
+        seen_urls.add(url_key)
 
-        # Find deck count or additional info
+        # Get meta share percentage
+        meta_share = None
+        pct_el = tile.select_one(".metagame-percentage .archetype-tile-statistic-value")
+        if pct_el:
+            pct_match = re.search(r"([\d.]+)\s*%", pct_el.get_text())
+            if pct_match:
+                meta_share = float(pct_match.group(1))
+
+        # Get deck count from the (N) after the percentage
         deck_count = None
-        count_match = re.search(r"(\d+)\s*deck", tile.get_text(), re.I)
-        if count_match:
-            deck_count = int(count_match.group(1))
+        if pct_el:
+            count_match = re.search(r"\((\d+)\)", pct_el.get_text())
+            if count_match:
+                deck_count = int(count_match.group(1))
 
         archetypes.append({
             "snapshot_date": snapshot_date,
@@ -107,55 +149,274 @@ def scrape_current_metagame() -> list[dict]:
             "meta_share_pct": meta_share,
             "deck_count": deck_count,
             "color_identity": infer_color_identity(name),
+            "archetype_url": archetype_url,
             "source": "mtggoldfish",
         })
 
-    log.info("Parsed %d archetypes from current metagame.", len(archetypes))
+    log.info("Parsed %d unique archetypes from metagame page.", len(archetypes))
     return archetypes
 
 
-def scrape_metagame_history(weeks_back: int = 12) -> list[dict]:
-    """Scrape multiple weeks of metagame data.
+# ── Archetype page scraper ──────────────────────────────────────────────
 
-    MTGGoldfish archives are limited, so we scrape what's available
-    and build historical data over time through repeated runs.
+
+def scrape_archetype_cards(archetype_url: str) -> list[dict]:
+    """Scrape the Card Breakdown from an archetype page.
+
+    Returns list of dicts: card_name, avg_copies, inclusion_pct, board.
+    Falls back to downloading the text decklist if Card Breakdown parsing fails.
     """
-    all_data = []
+    if not archetype_url:
+        log.warning("  No archetype URL provided, skipping")
+        return []
 
-    # Current metagame snapshot
-    current = scrape_current_metagame()
-    all_data.extend(current)
+    full_url = archetype_url
+    if not archetype_url.startswith("http"):
+        full_url = GOLDFISH_BASE + archetype_url
 
-    # Try to get historical pages if available
-    # MTGGoldfish sometimes has date-parameterized URLs
-    # For now, we capture the current state and accumulate over time
-    log.info(
-        "Captured %d archetype entries. "
-        "Historical data will accumulate with repeated runs.",
-        len(all_data),
+    # Use the paper version
+    if "#" not in full_url:
+        full_url += "#paper"
+
+    log.info("  Fetching archetype page: %s", full_url)
+    soup = _fetch(full_url)
+
+    # Primary strategy: Download text decklist (clean, structured format)
+    cards = _download_text_decklist(soup)
+    if cards:
+        log.info("    Parsed %d cards from text decklist download", len(cards))
+        return cards
+
+    # Fallback: Try parsing Card Breakdown HTML
+    log.info("    Text download failed, trying Card Breakdown HTML...")
+    cards = _parse_card_breakdown(soup)
+    if cards:
+        log.info("    Parsed %d cards from Card Breakdown", len(cards))
+        return cards
+
+    log.warning("    Failed to extract cards from archetype page")
+    return []
+
+
+def _parse_card_breakdown(soup: BeautifulSoup) -> list[dict]:
+    """Parse the Card Breakdown section for avg copies and inclusion rates.
+
+    The Card Breakdown typically has rows like:
+      Card Name | 3.9 | 100%
+    Split into mainboard sections (Creatures, Instants, etc.) and Sideboard.
+    """
+    cards = []
+    board = "main"
+
+    # Look for the card breakdown / metagame-deck-breakdown section
+    breakdown = soup.select_one(
+        ".archetype-breakdown, .metagame-breakdown, "
+        "#tab-tabletop .archetype-breakdown, "
+        "#tab-paper .archetype-breakdown"
     )
 
-    return all_data
+    if not breakdown:
+        breakdown = soup
+
+    rows = breakdown.select(
+        "tr, .archetype-breakdown-card, "
+        ".archetype-card-row, div[class*='card-row']"
+    )
+
+    for row in rows:
+        text = row.get_text(" ", strip=True)
+
+        # Detect sideboard section header
+        if re.search(r"\bsideboard\b", text, re.I) and len(text) < 30:
+            board = "side"
+            continue
+
+        # Try to extract: card name, quantity/avg copies, percentage
+        card_link = row.select_one("a[href*='/price/']")
+        if not card_link:
+            card_link = row.select_one("a")
+
+        if not card_link:
+            continue
+
+        card_name = card_link.get_text(strip=True)
+        if not card_name or len(card_name) < 2:
+            continue
+
+        # Extract numbers from the row text
+        numbers = re.findall(r"(\d+\.?\d*)", text.replace(card_name, "", 1))
+
+        avg_copies = 0.0
+        inclusion_pct = 1.0
+
+        if len(numbers) >= 2:
+            avg_copies = float(numbers[0])
+            pct_val = float(numbers[1])
+            inclusion_pct = pct_val / 100.0 if pct_val > 1 else pct_val
+        elif len(numbers) == 1:
+            avg_copies = float(numbers[0])
+
+        if avg_copies > 0:
+            cards.append({
+                "card_name": card_name,
+                "avg_copies": avg_copies,
+                "inclusion_pct": inclusion_pct,
+                "board": board,
+            })
+
+    return cards
 
 
-def run(weeks_back: int = 12) -> pd.DataFrame:
-    """Full pipeline: scrape → normalize → save."""
+def _download_text_decklist(soup: BeautifulSoup) -> list[dict]:
+    """Download and parse a text decklist from the download endpoint.
+
+    Looks for /deck/download/{id} links on the page, fetches the text file,
+    and parses lines of the form "4 Card Name".
+    """
+    download_link = soup.select_one("a[href*='/deck/download/']")
+    if not download_link:
+        return []
+
+    url = download_link["href"]
+    if not url.startswith("http"):
+        url = GOLDFISH_BASE + url
+
+    time.sleep(SCRAPE_DELAY)
+    resp = requests.get(url, headers=HEADERS, timeout=30)
+    if resp.status_code != 200:
+        return []
+
+    text = resp.text.strip()
+    cards = []
+    board = "main"
+    seen_cards = False  # Track if we've seen any cards yet
+
+    for line in text.split("\n"):
+        line = line.strip()
+
+        # Blank line after mainboard cards = sideboard boundary
+        if not line:
+            if seen_cards and board == "main":
+                board = "side"
+            continue
+
+        # Explicit sideboard header (some formats use this)
+        if re.match(r"(?i)sideboard", line):
+            board = "side"
+            continue
+
+        # Parse "N Card Name" pattern
+        match = re.match(r"(\d+)\s+(.+)", line)
+        if match:
+            copies = int(match.group(1))
+            name = match.group(2).strip()
+            # Remove set codes like "(WOE)" at end
+            name = re.sub(r"\s*\([A-Z0-9]+\)\s*$", "", name).strip()
+            if name:
+                seen_cards = True
+                cards.append({
+                    "card_name": name,
+                    "avg_copies": float(copies),
+                    "inclusion_pct": 1.0,  # Single deck — assume 100%
+                    "board": board,
+                })
+
+    return cards
+
+
+# ── Main pipeline ───────────────────────────────────────────────────────
+
+
+def run() -> pd.DataFrame:
+    """Full pipeline: scrape metagame + decklists for eligible archetypes."""
     DATA_PROCESSED.mkdir(parents=True, exist_ok=True)
 
-    snapshots = scrape_metagame_history(weeks_back=weeks_back)
+    # Step 1: Scrape metagame overview
+    snapshots = scrape_current_metagame()
+    meta_df = pd.DataFrame(snapshots)
 
-    df = pd.DataFrame(snapshots)
-
-    # If we have prior data, append rather than overwrite
+    # Append to existing data if available
     if METAGAME_PARQUET.exists():
         existing = pd.read_parquet(METAGAME_PARQUET)
-        df = pd.concat([existing, df], ignore_index=True)
-        # Deduplicate on (snapshot_date, archetype)
-        df = df.drop_duplicates(subset=["snapshot_date", "archetype"], keep="last")
+        meta_df = pd.concat([existing, meta_df], ignore_index=True)
+        meta_df = meta_df.drop_duplicates(subset=["snapshot_date", "archetype"], keep="last")
 
-    df.to_parquet(METAGAME_PARQUET, index=False)
-    log.info("Saved %d metagame rows to %s", len(df), METAGAME_PARQUET)
-    return df
+    meta_df.to_parquet(METAGAME_PARQUET, index=False)
+    log.info("Saved %d metagame rows to %s", len(meta_df), METAGAME_PARQUET)
+
+    # Step 2: Filter to eligible archetypes (≥ min meta share)
+    latest = (
+        meta_df.sort_values("snapshot_date")
+        .groupby("archetype")
+        .last()
+        .reset_index()
+    )
+    eligible = latest[latest["meta_share_pct"] >= DECK_MIN_META_SHARE]
+    log.info("\n%d archetypes with >= %.1f%% meta share:", len(eligible), DECK_MIN_META_SHARE)
+    for _, row in eligible.sort_values("meta_share_pct", ascending=False).iterrows():
+        log.info("  %5.1f%%  %s", row["meta_share_pct"], row["archetype"])
+
+    if eligible.empty:
+        log.warning("No archetypes meet the meta share threshold!")
+        empty_dl = pd.DataFrame(columns=[
+            "archetype", "card_name", "avg_copies", "inclusion_pct",
+            "board", "snapshot_date",
+        ])
+        empty_dl.to_parquet(DECKLISTS_PARQUET, index=False)
+        return meta_df
+
+    # Step 3: Scrape Card Breakdown for each eligible archetype
+    snapshot_date = datetime.now().strftime("%Y-%m-%d")
+    decklist_records = []
+
+    for _, row in eligible.iterrows():
+        arch_name = row["archetype"]
+        arch_url = row.get("archetype_url", "") or ""
+        arch_url = str(arch_url).strip() if pd.notna(arch_url) else ""
+
+        if not arch_url:
+            log.warning("  No URL for %s, skipping", arch_name)
+            continue
+
+        cards = scrape_archetype_cards(arch_url)
+        if not cards:
+            log.warning("  No cards found for %s — archetype will have no deck data", arch_name)
+            continue
+
+        for card in cards:
+            decklist_records.append({
+                "archetype": arch_name,
+                "card_name": card["card_name"],
+                "avg_copies": card["avg_copies"],
+                "inclusion_pct": card["inclusion_pct"],
+                "board": card["board"],
+                "snapshot_date": snapshot_date,
+            })
+
+    dl_df = pd.DataFrame(decklist_records)
+
+    # Append to existing if available
+    if DECKLISTS_PARQUET.exists():
+        existing_dl = pd.read_parquet(DECKLISTS_PARQUET)
+        if set(dl_df.columns) == set(existing_dl.columns):
+            dl_df = pd.concat([existing_dl, dl_df], ignore_index=True)
+            dl_df = dl_df.drop_duplicates(
+                subset=["snapshot_date", "archetype", "card_name", "board"],
+                keep="last",
+            )
+
+    dl_df.to_parquet(DECKLISTS_PARQUET, index=False)
+    log.info("\nSaved %d decklist rows to %s", len(dl_df), DECKLISTS_PARQUET)
+
+    # Summary
+    if not dl_df.empty:
+        for arch in sorted(dl_df["archetype"].unique()):
+            arch_cards = dl_df[dl_df["archetype"] == arch]
+            main = len(arch_cards[arch_cards["board"] == "main"])
+            side = len(arch_cards[arch_cards["board"] == "side"])
+            log.info("  %s: %d mainboard + %d sideboard cards", arch, main, side)
+
+    return meta_df
 
 
 if __name__ == "__main__":

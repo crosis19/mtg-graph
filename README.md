@@ -1,13 +1,18 @@
-# MTG Metagame Graph Neural Network
+# MTG Deck Composition Predictor
 
-A Heterogeneous Graph Transformer (HGT) for predicting Magic: The Gathering Standard metagame trends using graph neural networks.
+A Heterogeneous Graph Transformer (HGT) that predicts which cards belong in which Magic: The Gathering Standard deck archetypes using BPR ranking loss and leave-one-out attention pooling.
 
 ## Overview
 
-This project models the MTG Standard metagame as a heterogeneous graph with four node types and multiple edge types, then trains a two-headed GNN to make predictions:
+This project models the MTG Standard metagame as a heterogeneous graph with three node types and multiple edge types, then trains a GNN to rank cards by their likelihood of inclusion in each archetype's deck.
 
-- **Archetype Emergence** (regression) — predicts which archetypes will gain or lose meta share
-- **Tournament Top 8** (link prediction) — predicts archetype placement probability in upcoming events
+### Key Features
+
+- **BPR ranking loss** — directly optimizes per-archetype card ranking instead of pointwise classification
+- **Leave-one-out attention pooling** — prevents information leakage during training by excluding the predicted card from the archetype's embedding
+- **Card-level train/val/test split** — tests generalization to unseen cards
+- **30-day recency filter** — uses only recent decklists from MTGGoldfish
+- **Early stopping on Hits@25** — checkpoints on the metric that matters
 
 ## Architecture
 
@@ -15,30 +20,32 @@ This project models the MTG Standard metagame as a heterogeneous graph with four
 
 | Node Type | Count | Features |
 |-----------|-------|----------|
-| Card | ~4,168 | 384-dim semantic embedding + 11 numeric (cmc, colors, types, etc.) |
-| Archetype | ~12-32 | meta share, win rate, color count |
-| Tournament | ~15-24 | player count, time ordinal |
-| Set | ~12-15 | recency, size, avg cmc |
+| Card | ~4,168 | 384-dim semantic embedding + 11 numeric (cmc, colors, types, banned, etc.) |
+| Archetype | ~6 | 390-dim (meta share, colors, creature/spell ratios, avg cmc, mean card embedding) |
+| Set | ~16 | recency, size, avg cmc |
 
 | Edge Type | Description |
 |-----------|-------------|
 | `(card, keyword_synergy, card)` | Complementary keywords (e.g., deathtouch + first strike) |
 | `(card, mechanical_synergy, card)` | Trigger/enabler patterns |
 | `(card, semantic_synergy, card)` | Oracle text embedding similarity |
-| `(card, co_occurrence, card)` | Deck co-occurrence across tournaments |
-| `(archetype, contains, card)` | Decklist inclusion (weighted by avg copies) |
+| `(archetype, maindecks, card)` | Mainboard inclusion (edge_attr: avg copies, inclusion rate) |
+| `(card, maindeck_of, archetype)` | Reverse |
+| `(archetype, sideboards, card)` | Sideboard inclusion (edge_attr: avg copies, inclusion rate) |
+| `(card, sideboard_of, archetype)` | Reverse |
 | `(archetype, counters, archetype)` | Favorable matchup (>55% win rate, directed) |
-| `(archetype, countered_by, archetype)` | Reverse of counters (receives predator info) |
-| `(archetype, top8, tournament)` | Top 8 placement (weighted by slot count) |
+| `(archetype, countered_by, archetype)` | Reverse |
 | `(set, printed_in, card)` | Set membership |
+| `(card, from_set, set)` | Reverse |
 
 ### Model
 
-Two-headed Heterogeneous Graph Transformer:
-- **Backbone**: 3-layer HGT with 4 attention heads and 128 hidden dimensions
-- **Head 1**: Linear regression on archetype embeddings for emergence prediction
-- **Head 2**: Bilinear decoder for archetype-tournament link prediction
-- **Training**: MSE + BCE loss with temporal train/val split (75/25)
+HGT card backbone + BPR ranking with leave-one-out attention pooling:
+- **Card embeddings**: HGT over synergy + set edges (cards don't see deck assignments)
+- **Archetype embeddings**: Attention-weighted pool over each deck's card embeddings; during training, the card being predicted is excluded (leave-one-out) to prevent information leakage
+- **Prediction head**: `concat(card_emb, arch_emb, card_emb * arch_emb)` → MLP → logit
+- **Training**: BPR loss with color-identity-aware hard negative sampling
+- **Metrics**: Hits@K, MRR, F1
 
 ## Project Structure
 
@@ -48,23 +55,22 @@ mtg-graph/
 │   ├── config.py              # Paths, constants, hyperparameters (.env support)
 │   ├── ingest_all.py          # CLI orchestrator for Phases 1-3 with validation
 │   ├── ingest_cards.py        # Phase 1: Download cards from Scryfall API
-│   ├── ingest_tournaments.py  # Phase 1: Scrape tournament results (MTGTOP8)
-│   ├── ingest_metagame.py     # Phase 1: Scrape metagame snapshots (MTGGoldfish)
+│   ├── ingest_metagame.py     # Phase 1: Scrape metagame + decklists (MTGGoldfish)
 │   ├── ingest_matchups.py     # Phase 1: Scrape matchup win rates (MTGDecks)
 │   ├── oracle_parser.py       # Utility for parsing card oracle text
 │   ├── keyword_matrix.py      # Phase 2: Keyword synergy edge extraction
 │   ├── card_embeddings.py     # Phase 2: Semantic embeddings (SentenceTransformer)
 │   ├── synergy_eval.py        # Phase 2: Synergy edge quality evaluation
 │   ├── graph_builder.py       # Phase 3: Assemble HeteroData graph
-│   ├── model.py               # Phase 4: Two-headed HGT model definition
-│   ├── train.py               # Phase 4: Training loop with temporal split
-│   ├── synthetic_data.py      # Generate synthetic data for development
-│   └── visualize.py           # Phase 5: Interactive HTML dashboard
+│   ├── deck_predictor.py      # Phase 4: Deck composition predictor model
+│   ├── train_deck.py          # Phase 4: BPR training loop with early stopping
+│   ├── visualize_deck.py      # Phase 5: Interactive HTML dashboard
+│   └── synthetic_data.py      # Generate synthetic data for development
 ├── data/                      # Generated by pipeline (not committed)
-├── results/                   # Timestamped training runs (logs committed, binaries not)
+├── results/
+│   └── deck/                  # Training runs (timestamped)
 ├── notebooks/
-│   └── train_colab.ipynb      # GPU training on Google Colab
-├── tests/
+│   └── train_deck_colab.ipynb # GPU training on Google Colab
 ├── pyproject.toml
 ├── requirements.txt
 └── .env.example
@@ -80,22 +86,14 @@ mtg-graph/
 ### Installation
 
 ```bash
-# Clone the repo
 git clone https://github.com/<your-username>/mtg-graph.git
 cd mtg-graph
 
-# Create virtual environment
 python -m venv .venv
 source .venv/bin/activate  # Linux/macOS
 # .venv\Scripts\activate   # Windows
 
-# Install dependencies
 pip install -e .
-
-# Or from requirements.txt
-pip install -r requirements.txt
-
-# Download spaCy model (if needed)
 python -m spacy download en_core_web_sm
 ```
 
@@ -110,8 +108,6 @@ cp .env.example .env
 
 ### Data Ingestion (Phases 1-3)
 
-Use the CLI orchestrator to run data ingestion with built-in validation:
-
 ```bash
 python -m src.ingest_all                # Full pipeline (Phases 1-3)
 python -m src.ingest_all --phase 1      # Phase 1 only (scrape external data)
@@ -121,43 +117,23 @@ python -m src.ingest_all --skip-scrape  # Phases 2-3 (reuse existing scraped dat
 python -m src.ingest_all --validate-only # Check existing output files
 ```
 
-Each step prints a validation report (row counts, null rates, archetype consistency)
-so you can inspect the data before training.
-
-You can also run individual steps directly:
-
-```bash
-python -m src.ingest_cards        # Scryfall card data
-python -m src.ingest_tournaments  # Tournament results + decklists
-python -m src.ingest_metagame     # Metagame share snapshots
-python -m src.ingest_matchups     # Archetype matchup win rates
-python -m src.keyword_matrix      # Keyword synergy edges
-python -m src.card_embeddings     # Semantic embedding edges
-python -m src.graph_builder       # Assemble HeteroData graph
-```
-
 ### Training (Phase 4)
 
 ```bash
-# Local training (CPU)
-python -m src.train
+python -m src.train_deck
 
-# GPU training via Colab — see notebooks/train_colab.ipynb
+# GPU training via Colab — see notebooks/train_deck_colab.ipynb
 ```
 
-Each training run saves results to a timestamped folder under `results/`:
+Each training run saves to a timestamped folder under `results/deck/`:
 - `model.pt` — best model checkpoint
-- `training_log.json` — hyperparameters, epoch curves, final test metrics
+- `training_log.json` — hyperparameters, epoch curves, final metrics
 - `dashboard.html` — interactive visualization
 
-### Development (Synthetic Data)
-
-For quick testing without scraping:
+### Dashboard Generation
 
 ```bash
-python -m src.synthetic_data
-python -m src.graph_builder
-python -m src.train
+python -m src.visualize_deck
 ```
 
 ## Data Sources
@@ -167,8 +143,7 @@ All data is downloaded or scraped by the pipeline — no data files are committe
 | Source | Data | Module |
 |--------|------|--------|
 | [Scryfall API](https://scryfall.com/docs/api) | Card oracle text, attributes, set info | `ingest_cards.py` |
-| [MTGGoldfish](https://www.mtggoldfish.com) | Weekly metagame share snapshots | `ingest_metagame.py` |
-| [MTGTOP8](https://www.mtgtop8.com) | Tournament results and top 8 decklists | `ingest_tournaments.py` |
+| [MTGGoldfish](https://www.mtggoldfish.com/metagame/standard#paper) | Metagame share + archetype decklists (30-day paper) | `ingest_metagame.py` |
 | [MTGDecks](https://www.mtgdecks.net) | Archetype matchup win rates | `ingest_matchups.py` |
 
 ## License
