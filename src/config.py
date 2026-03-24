@@ -41,6 +41,12 @@ SEMANTIC_SIMILARITY_THRESHOLD = float(os.getenv("SEMANTIC_SIMILARITY_THRESHOLD",
 # Rate limiting for scrapers (seconds between requests)
 SCRAPE_DELAY = float(os.getenv("SCRAPE_DELAY", "2.0"))
 
+# MTGDecks matchup data
+MTGDECKS_WINRATES_URL = os.getenv(
+    "MTGDECKS_WINRATES_URL",
+    "https://mtgdecks.net/Standard/winrates/range:last30days",
+)
+
 # Graph construction
 GRAPH_PATH = DATA_PROCESSED / "graph.pt"
 COUNTERS_WIN_RATE_THRESHOLD = float(os.getenv("COUNTERS_WIN_RATE_THRESHOLD", "55.0"))

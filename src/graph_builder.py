@@ -489,6 +489,66 @@ def _build_deck_edges(
     return results
 
 
+def _fuzzy_match_archetypes(
+    matchup_names: set[str],
+    graph_names: dict[str, int],
+    threshold: float = 0.75,
+) -> dict[str, int]:
+    """Build a mapping from matchup archetype names to graph node indices.
+
+    Tries exact match first, then falls back to fuzzy matching that requires
+    the color identity (first word) to match. This prevents false positives
+    like 'Mardu Midrange' → 'Dimir Midrange'.
+    """
+    from difflib import SequenceMatcher
+
+    mapping: dict[str, int] = {}
+    fuzzy_matches: list[tuple[str, str, float]] = []
+
+    def _normalize(s: str) -> str:
+        return s.lower().replace("-", " ").strip()
+
+    def _color_word(s: str) -> str:
+        """Extract the color identity prefix (e.g., 'mono green', 'izzet')."""
+        return _normalize(s).split()[0] if s.strip() else ""
+
+    for name in matchup_names:
+        # Exact match
+        if name in graph_names:
+            mapping[name] = graph_names[name]
+            continue
+
+        # Fuzzy match: require the color identity word to match
+        name_color = _color_word(name)
+        best_match = None
+        best_score = 0.0
+        name_norm = _normalize(name)
+
+        for gname in graph_names:
+            gname_color = _color_word(gname)
+
+            # Color identity must match (izzet=izzet, mono=mono, dimir=dimir)
+            if name_color != gname_color:
+                continue
+
+            gname_norm = _normalize(gname)
+            score = SequenceMatcher(None, name_norm, gname_norm).ratio()
+            if score > best_score:
+                best_score = score
+                best_match = gname
+
+        if best_match and best_score >= threshold:
+            mapping[name] = graph_names[best_match]
+            fuzzy_matches.append((name, best_match, best_score))
+
+    if fuzzy_matches:
+        log.info("  Fuzzy-matched archetype names:")
+        for src, dst, score in fuzzy_matches:
+            log.info(f"    '{src}' → '{dst}' (score={score:.2f})")
+
+    return mapping
+
+
 def _build_counters_edges(
     matchups: pd.DataFrame,
     arch_name_to_idx: dict,
@@ -496,25 +556,32 @@ def _build_counters_edges(
     """Build directed archetype -> archetype 'counters' edges.
 
     Only creates edge when win_rate > COUNTERS_WIN_RATE_THRESHOLD.
+    Uses fuzzy matching to handle naming differences between data sources.
     """
+    # Build fuzzy name mapping
+    matchup_names = set(matchups["archetype_a"].unique()) | set(matchups["archetype_b"].unique())
+    name_to_idx = _fuzzy_match_archetypes(matchup_names, arch_name_to_idx)
+    log.info(f"  Matched {len(name_to_idx)}/{len(matchup_names)} matchup archetypes "
+             f"to {len(arch_name_to_idx)} graph archetypes")
+
     src_list, dst_list, weight_list = [], [], []
 
     for _, row in matchups.iterrows():
         arch_a = row["archetype_a"]
         arch_b = row["archetype_b"]
-        if arch_a not in arch_name_to_idx or arch_b not in arch_name_to_idx:
+        if arch_a not in name_to_idx or arch_b not in name_to_idx:
             continue
 
         # A counters B
         if row["win_rate_a"] > COUNTERS_WIN_RATE_THRESHOLD:
-            src_list.append(arch_name_to_idx[arch_a])
-            dst_list.append(arch_name_to_idx[arch_b])
+            src_list.append(name_to_idx[arch_a])
+            dst_list.append(name_to_idx[arch_b])
             weight_list.append(row["win_rate_a"] / 100.0)
 
         # B counters A
         if row["win_rate_b"] > COUNTERS_WIN_RATE_THRESHOLD:
-            src_list.append(arch_name_to_idx[arch_b])
-            dst_list.append(arch_name_to_idx[arch_a])
+            src_list.append(name_to_idx[arch_b])
+            dst_list.append(name_to_idx[arch_a])
             weight_list.append(row["win_rate_b"] / 100.0)
 
     edge_index = torch.tensor([src_list, dst_list], dtype=torch.long)

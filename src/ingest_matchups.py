@@ -1,6 +1,6 @@
 """Phase 1: Scrape head-to-head archetype matchup win rates.
 
-Collects pairwise win rates between archetypes from MTGDecks or similar sources.
+Collects pairwise win rates between archetypes from MTGDecks.net (last 30 days).
 These become the weighted "counters" edges in the graph.
 
 Outputs: matchups.parquet
@@ -12,72 +12,87 @@ import time
 from datetime import datetime
 
 import pandas as pd
-import requests
 from bs4 import BeautifulSoup
 
-from src.config import MATCHUPS_PARQUET, DATA_PROCESSED, SCRAPE_DELAY
+try:
+    import cloudscraper
+except ImportError:
+    cloudscraper = None
+
+import requests
+
+from src.config import MATCHUPS_PARQUET, DATA_PROCESSED, SCRAPE_DELAY, MTGDECKS_WINRATES_URL
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 HEADERS = {
-    "User-Agent": "MTG-Graph-Research/1.0 (academic project; respectful scraping)",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml",
 }
-
-# MTGDecks.net winrates page for Standard
-MTGDECKS_WINRATES_URL = "https://mtgdecks.net/Standard/winrates"
 
 
 def scrape_mtgdecks_matchups() -> list[dict]:
-    """Scrape head-to-head matchup data from MTGDecks.net."""
+    """Scrape head-to-head matchup data from MTGDecks.net.
+
+    Returns list of dicts with columns:
+        archetype_a, archetype_b, win_rate_a, win_rate_b,
+        sample_size, snapshot_date, source
+    Win rates are stored as percentages (0-100).
+    """
     log.info("Fetching matchup data from %s", MTGDECKS_WINRATES_URL)
 
     time.sleep(SCRAPE_DELAY)
     try:
-        resp = requests.get(MTGDECKS_WINRATES_URL, headers=HEADERS, timeout=30)
+        # MTGDecks uses Cloudflare JS challenge — cloudscraper handles it
+        if cloudscraper is not None:
+            scraper = cloudscraper.create_scraper()
+            resp = scraper.get(MTGDECKS_WINRATES_URL, timeout=30)
+        else:
+            log.warning("cloudscraper not installed; falling back to requests "
+                        "(may fail on Cloudflare-protected sites)")
+            resp = requests.get(MTGDECKS_WINRATES_URL, headers=HEADERS, timeout=30)
         resp.raise_for_status()
     except requests.RequestException as e:
         log.warning("Failed to fetch matchup data: %s", e)
         return []
 
     soup = BeautifulSoup(resp.text, "lxml")
-    matchups = []
+    table = soup.find("table", id="winrates")
+    if not table:
+        log.warning("No table#winrates found on page")
+        return []
 
-    # MTGDecks typically shows matchups in a matrix table
-    tables = soup.find_all("table")
-
-    for table in tables:
-        matchups.extend(_parse_matchup_table(table))
-
-    if not matchups:
-        # Fallback: try parsing from any structured data on the page
-        matchups = _parse_matchup_fallback(soup)
-
-    log.info("Parsed %d matchup records.", len(matchups))
-    return matchups
+    return _parse_winrate_table(table)
 
 
-def _parse_matchup_table(table) -> list[dict]:
-    """Parse a matchup matrix table into pairwise records."""
+def _parse_winrate_table(table) -> list[dict]:
+    """Parse the MTGDecks winrate matrix table.
+
+    Structure:
+    - Header row: ['', 'Overall', arch1, arch2, ...]
+    - Data rows: [arch_name, overall_cell, cell1, cell2, ...]
+    - Each cell has class 'winrate-cell' and data-winrate='N' (percentage int)
+    - Sample size in cell text as 'N matches'
+    - Mirror/empty cells show '--' with no data-winrate
+    """
     records = []
-
-    # Get header row for archetype names
-    header_row = table.find("tr")
-    if not header_row:
+    rows = table.find_all("tr")
+    if len(rows) < 2:
         return records
 
-    headers = []
-    for th in header_row.find_all(["th", "td"]):
-        text = th.get_text(strip=True)
-        if text:
-            headers.append(text)
+    # Extract column archetype names from header (skip '' and 'Overall')
+    header_cells = rows[0].find_all(["th", "td"])
+    col_names = [c.get_text(strip=True) for c in header_cells]
 
-    if len(headers) < 3:  # Need at least row label + 2 archetypes
-        return records
+    snapshot_date = datetime.now().strftime("%Y-%m-%d")
 
-    # Parse data rows
-    for row in table.find_all("tr")[1:]:
-        cells = row.find_all(["td", "th"])
+    for row in rows[1:]:
+        cells = row.find_all(["th", "td"])
         if not cells:
             continue
 
@@ -85,137 +100,89 @@ def _parse_matchup_table(table) -> list[dict]:
         if not row_archetype:
             continue
 
-        for i, cell in enumerate(cells[1:], start=1):
-            if i >= len(headers):
+        # cells[1:] correspond to col_names[1:]
+        for j, cell in enumerate(cells[1:], start=1):
+            if j >= len(col_names):
                 break
 
-            col_archetype = headers[i]
-            text = cell.get_text(strip=True)
+            col_archetype = col_names[j]
 
-            # Look for win rate percentage
-            pct_match = re.search(r"([\d.]+)\s*%?", text)
-            if not pct_match:
+            # Skip 'Overall' column and mirror matches
+            if col_archetype == "Overall" or col_archetype == row_archetype:
                 continue
 
-            win_rate = float(pct_match.group(1))
-            # Normalize to 0-1 range if given as percentage
-            if win_rate > 1:
-                win_rate /= 100.0
+            # Get win rate from data attribute
+            win_rate_str = cell.get("data-winrate")
+            if not win_rate_str:
+                continue  # '--' empty cell
 
-            # Skip mirror matches and invalid data
-            if row_archetype == col_archetype:
-                continue
-            if win_rate < 0 or win_rate > 1:
+            try:
+                win_rate_a = float(win_rate_str)  # percentage (0-100)
+            except (ValueError, TypeError):
                 continue
 
-            # Look for sample size
-            sample_match = re.search(r"(\d+)\s*(?:games?|matches?|samples?)", text, re.I)
-            sample_size = int(sample_match.group(1)) if sample_match else None
+            if win_rate_a < 0 or win_rate_a > 100:
+                continue
+
+            # Extract sample size from cell text
+            cell_text = cell.get_text()
+            match = re.search(r"([\d,]+)\s*matches", cell_text)
+            sample_size = int(match.group(1).replace(",", "")) if match else None
 
             records.append({
                 "archetype_a": row_archetype,
                 "archetype_b": col_archetype,
-                "win_rate_a": win_rate,
-                "win_rate_b": 1.0 - win_rate,
+                "win_rate_a": win_rate_a,
+                "win_rate_b": 100.0 - win_rate_a,
                 "sample_size": sample_size,
-                "snapshot_date": datetime.now().strftime("%Y-%m-%d"),
+                "snapshot_date": snapshot_date,
                 "source": "mtgdecks",
             })
 
+    # Normalize archetype names to match MTGGoldfish convention
+    # MTGDecks: "Mono Green Landfall" → MTGGoldfish: "Mono-Green Landfall"
+    for rec in records:
+        rec["archetype_a"] = _normalize_archetype_name(rec["archetype_a"])
+        rec["archetype_b"] = _normalize_archetype_name(rec["archetype_b"])
+
+    log.info("Parsed %d matchup records.", len(records))
     return records
 
 
-def _parse_matchup_fallback(soup: BeautifulSoup) -> list[dict]:
-    """Fallback parser for when the table structure doesn't match."""
-    records = []
+def _normalize_archetype_name(name: str) -> str:
+    """Normalize archetype names so MTGDecks names match MTGGoldfish convention.
 
-    # Look for any text patterns like "Archetype A vs Archetype B: 55%"
-    text = soup.get_text()
-    pattern = re.compile(
-        r"([A-Z][\w\s-]+?)\s+vs\.?\s+([A-Z][\w\s-]+?)[\s:]+(\d+(?:\.\d+)?)\s*%",
-        re.MULTILINE,
-    )
-
-    for match in pattern.finditer(text):
-        arch_a = match.group(1).strip()
-        arch_b = match.group(2).strip()
-        win_rate = float(match.group(3)) / 100.0
-
-        if 0 < win_rate < 1 and arch_a != arch_b:
-            records.append({
-                "archetype_a": arch_a,
-                "archetype_b": arch_b,
-                "win_rate_a": win_rate,
-                "win_rate_b": 1.0 - win_rate,
-                "sample_size": None,
-                "snapshot_date": datetime.now().strftime("%Y-%m-%d"),
-                "source": "mtgdecks",
-            })
-
-    return records
-
-
-def compute_counters_edges(
-    matchups_df: pd.DataFrame,
-    threshold: float = 0.55,
-    min_samples: int = 10,
-) -> pd.DataFrame:
-    """Derive directed 'counters' edges from matchup data.
-
-    A 'counters' edge A → B means archetype A has a favorable matchup
-    against B (win rate > threshold).
-
-    Args:
-        matchups_df: Raw matchup data.
-        threshold: Minimum win rate to constitute a "counters" relationship.
-        min_samples: Minimum sample size to trust the matchup data.
+    'Mono Green Landfall' → 'Mono-Green Landfall'
+    'Mono Red Aggro'      → 'Mono-Red Aggro'
     """
-    if matchups_df.empty:
-        return pd.DataFrame()
-
-    df = matchups_df.copy()
-
-    # Filter by sample size if available
-    if "sample_size" in df.columns:
-        has_samples = df["sample_size"].notna()
-        df = df[~has_samples | (df["sample_size"] >= min_samples)]
-
-    # Create counters edges where win rate exceeds threshold
-    counters = df[df["win_rate_a"] >= threshold].copy()
-    counters = counters.rename(columns={
-        "archetype_a": "source",
-        "archetype_b": "target",
-        "win_rate_a": "weight",
-    })
-    counters["edge_type"] = "counters"
-    counters = counters[["source", "target", "weight", "edge_type", "sample_size", "snapshot_date"]]
-
-    log.info(
-        "Derived %d counters edges (threshold=%.2f, min_samples=%d).",
-        len(counters), threshold, min_samples,
-    )
-    return counters
+    return re.sub(r"\bMono\s+", "Mono-", name)
 
 
 def run() -> pd.DataFrame:
-    """Full pipeline: scrape → derive counters → save."""
+    """Full pipeline: scrape → save (replaces stale data)."""
     DATA_PROCESSED.mkdir(parents=True, exist_ok=True)
 
     matchups = scrape_mtgdecks_matchups()
     df = pd.DataFrame(matchups)
 
-    # Append to existing data if present
-    if MATCHUPS_PARQUET.exists():
-        existing = pd.read_parquet(MATCHUPS_PARQUET)
-        df = pd.concat([existing, df], ignore_index=True)
+    if not df.empty:
+        # Deduplicate: keep one record per archetype pair per snapshot
         df = df.drop_duplicates(
             subset=["archetype_a", "archetype_b", "snapshot_date"],
             keep="last",
         )
-
-    if not df.empty:
         df.to_parquet(MATCHUPS_PARQUET, index=False)
         log.info("Saved %d matchup rows to %s", len(df), MATCHUPS_PARQUET)
+
+        # Summary
+        unique_archs = set(df["archetype_a"].unique()) | set(df["archetype_b"].unique())
+        log.info("  Unique archetypes: %d", len(unique_archs))
+        log.info("  Win rate range: %.1f%% to %.1f%%",
+                 df["win_rate_a"].min(), df["win_rate_a"].max())
+        if df["sample_size"].notna().any():
+            log.info("  Sample size range: %d to %d",
+                     df["sample_size"].dropna().astype(int).min(),
+                     df["sample_size"].dropna().astype(int).max())
     else:
         log.warning("No matchup data collected. Saving empty parquet.")
         df = pd.DataFrame(columns=[

@@ -1,9 +1,9 @@
 """Generate interactive dashboard for the Deck Composition Predictor.
 
 Produces a self-contained HTML file with:
-  1. Model performance stats (Hits@K, MRR, F1)
+  1. Model performance stats — val (all-cards) and test (held-out cards)
   2. Training curves (BPR loss, Hits@10, Hits@15)
-  3. Per-archetype predicted vs actual card tables
+  3. Per-archetype predicted vs actual card tables with Hits@10
   4. Hyperparameters panel
 
 Reads from training_log.json and model checkpoint in the run directory.
@@ -26,7 +26,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger(__name__)
 
 
-def _get_deck_predictions(data, model, top_n: int = 20) -> dict:
+def _get_deck_predictions(data, model, top_n: int = 10) -> dict:
     """Score all cards for each archetype and return top predictions + actuals."""
     model.eval()
     with torch.no_grad():
@@ -67,11 +67,14 @@ def _get_deck_predictions(data, model, top_n: int = 20) -> dict:
             ]
 
             actual_cards = sorted(arch_actual.get(a_idx, set()))
+            top_k_set = {card_names[int(i)] for i in top_k.indices}
+            hits_in_top = len(top_k_set & set(actual_cards))
 
             results[arch_name] = {
                 "predicted": predicted,
                 "actual": actual_cards,
                 "n_actual": len(actual_cards),
+                "hits_in_top": hits_in_top,
             }
 
     return results
@@ -82,6 +85,7 @@ def generate_deck_html(training_log: dict, deck_predictions: dict) -> str:
 
     metrics = training_log.get("final_metrics", {})
     test = metrics.get("test", {})
+    val = metrics.get("val", {})
     hp = training_log.get("hyperparameters", {})
     curves = training_log.get("training_curves", {})
     best_epoch = training_log.get("best_epoch", 0)
@@ -91,6 +95,12 @@ def generate_deck_html(training_log: dict, deck_predictions: dict) -> str:
     val_hits10 = curves.get("val_hits10", curves.get("val_hits25", curves.get("val_accs", [])))
     val_hits15 = curves.get("val_hits15", [])
 
+    # Best val metrics from training curves (all-cards ranking — the meaningful signal)
+    best_val_hits10 = max(val_hits10) if val_hits10 else 0
+    best_val_hits15 = max(val_hits15) if val_hits15 else 0
+    val_mrr_curve = curves.get("val_mrr", [])
+    best_val_mrr = max(val_mrr_curve) if val_mrr_curve else 0
+
     # Build archetype cards HTML
     arch_cards_html = ""
     for arch_name, pred_data in sorted(deck_predictions.items()):
@@ -98,7 +108,7 @@ def generate_deck_html(training_log: dict, deck_predictions: dict) -> str:
         n_actual = pred_data["n_actual"]
 
         top_cards = pred_data["predicted"]
-        hits_in_top = sum(1 for p in top_cards if p["card"] in actual_set)
+        hits_in_top = pred_data.get("hits_in_top", sum(1 for p in top_cards if p["card"] in actual_set))
 
         rows = ""
         for p in top_cards:
@@ -116,7 +126,7 @@ def generate_deck_html(training_log: dict, deck_predictions: dict) -> str:
         <div class="arch-section">
           <div class="arch-header">
             <span class="arch-name">{arch_name}</span>
-            <span class="arch-stats">{hits_in_top}/{len(top_cards)} predicted in actual deck ({n_actual} cards total)</span>
+            <span class="arch-stats">Hits@{len(top_cards)}: {hits_in_top}/{len(top_cards)} in deck ({n_actual} unique cards total)</span>
           </div>
           <table>
             <thead><tr><th>Confidence</th><th>Card</th><th>Status</th></tr></thead>
@@ -176,7 +186,7 @@ def generate_deck_html(training_log: dict, deck_predictions: dict) -> str:
     .full-width {{ grid-column: 1 / -1; }}
     .stat-grid {{
       display: grid;
-      grid-template-columns: repeat(6, 1fr);
+      grid-template-columns: repeat(4, 1fr);
       gap: 12px;
       margin-bottom: 8px;
     }}
@@ -187,10 +197,16 @@ def generate_deck_html(training_log: dict, deck_predictions: dict) -> str:
       border-radius: 8px;
     }}
     .stat-value {{ font-size: 24px; font-weight: 700; color: #fff; }}
+    .stat-sub {{ font-size: 11px; color: #666; margin-top: 2px; }}
     .stat-label {{
       font-size: 11px; color: #666; margin-top: 4px;
       text-transform: uppercase; letter-spacing: 0.05em;
     }}
+    .metrics-row-label {{
+      font-size: 11px; color: #555; text-transform: uppercase;
+      letter-spacing: 0.05em; margin-bottom: 4px; margin-top: 8px;
+    }}
+    .metrics-row-label:first-child {{ margin-top: 0; }}
     table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
     th {{
       text-align: left; padding: 6px 8px; color: #888; font-weight: 500;
@@ -236,13 +252,33 @@ def generate_deck_html(training_log: dict, deck_predictions: dict) -> str:
   <div class="grid" style="margin-bottom:16px">
     <div class="panel full-width">
       <div class="panel-body">
+        <div class="metrics-row-label">Validation (all cards)</div>
         <div class="stat-grid">
           <div class="stat">
-            <div class="stat-value">{test.get('hits_at_10', test.get('hits_at_25', 0)):.1%}</div>
+            <div class="stat-value">{best_val_hits10:.1%}</div>
             <div class="stat-label">Hits@10</div>
           </div>
           <div class="stat">
-            <div class="stat-value">{test.get('hits_at_15', test.get('hits_at_50', 0)):.1%}</div>
+            <div class="stat-value">{best_val_hits15:.1%}</div>
+            <div class="stat-label">Hits@15</div>
+          </div>
+          <div class="stat">
+            <div class="stat-value">{best_val_mrr:.3f}</div>
+            <div class="stat-label">MRR</div>
+          </div>
+          <div class="stat">
+            <div class="stat-value">{best_epoch}</div>
+            <div class="stat-label">Best Epoch</div>
+          </div>
+        </div>
+        <div class="metrics-row-label">Test (held-out cards &mdash; {data_split.get('test_cards', '?')} cards)</div>
+        <div class="stat-grid">
+          <div class="stat">
+            <div class="stat-value">{test.get('hits_at_10', 0):.1%}</div>
+            <div class="stat-label">Hits@10</div>
+          </div>
+          <div class="stat">
+            <div class="stat-value">{test.get('hits_at_15', 0):.1%}</div>
             <div class="stat-label">Hits@15</div>
           </div>
           <div class="stat">
@@ -251,15 +287,7 @@ def generate_deck_html(training_log: dict, deck_predictions: dict) -> str:
           </div>
           <div class="stat">
             <div class="stat-value">{test.get('f1', 0):.1%}</div>
-            <div class="stat-label">F1 Score</div>
-          </div>
-          <div class="stat">
-            <div class="stat-value">{test.get('precision', 0):.1%}</div>
-            <div class="stat-label">Precision</div>
-          </div>
-          <div class="stat">
-            <div class="stat-value">{best_epoch}</div>
-            <div class="stat-label">Best Epoch</div>
+            <div class="stat-label">F1</div>
           </div>
         </div>
       </div>
@@ -292,7 +320,7 @@ def generate_deck_html(training_log: dict, deck_predictions: dict) -> str:
           <dt>Patience</dt><dd>{hp.get('patience', '?')}</dd>
           <dt>Checkpoint</dt><dd>{hp.get('checkpoint_metric', '?')}</dd>
           <dt>Freeze HGT</dt><dd>{hp.get('freeze_hgt', False)}</dd>
-          <dt>Split</dt><dd>{split_type}</dd>
+          <dt>LR Schedule</dt><dd>{hp.get('warmup_epochs', 0)}ep warmup &rarr; {hp.get('lr_scheduler', '?')}</dd>
           <dt>Recency</dt><dd>{hp.get('recency_days', '?')}d</dd>
         </dl>
       </div>
@@ -440,7 +468,7 @@ def main(run_dir=None, model_path=None):
     model.load_state_dict(checkpoint["model_state_dict"])
 
     log.info("Getting deck predictions...")
-    deck_predictions = _get_deck_predictions(data, model, top_n=20)
+    deck_predictions = _get_deck_predictions(data, model, top_n=10)
 
     log.info("Generating HTML dashboard...")
     html = generate_deck_html(training_log, deck_predictions)
