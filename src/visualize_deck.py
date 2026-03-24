@@ -2,7 +2,7 @@
 
 Produces a self-contained HTML file with:
   1. Model performance stats (Hits@K, MRR, F1)
-  2. Training curves (BPR loss, Hits@25, F1)
+  2. Training curves (BPR loss, Hits@10, Hits@15)
   3. Per-archetype predicted vs actual card tables
   4. Hyperparameters panel
 
@@ -88,9 +88,8 @@ def generate_deck_html(training_log: dict, deck_predictions: dict) -> str:
     loss_type = training_log.get("loss_type", "bce")
 
     train_losses = curves.get("train_losses", [])
-    # Support both old and new format
-    val_hits25 = curves.get("val_hits25", curves.get("val_accs", []))
-    val_f1 = curves.get("val_f1", [])
+    val_hits10 = curves.get("val_hits10", curves.get("val_hits25", curves.get("val_accs", [])))
+    val_hits15 = curves.get("val_hits15", [])
 
     # Build archetype cards HTML
     arch_cards_html = ""
@@ -126,8 +125,8 @@ def generate_deck_html(training_log: dict, deck_predictions: dict) -> str:
         </div>"""
 
     train_losses_json = json.dumps(train_losses)
-    val_hits25_json = json.dumps(val_hits25)
-    val_f1_json = json.dumps(val_f1)
+    val_hits10_json = json.dumps(val_hits10)
+    val_hits15_json = json.dumps(val_hits15)
     num_epochs = hp.get("num_epochs", 50)
 
     # Data split info
@@ -239,12 +238,12 @@ def generate_deck_html(training_log: dict, deck_predictions: dict) -> str:
       <div class="panel-body">
         <div class="stat-grid">
           <div class="stat">
-            <div class="stat-value">{test.get('hits_at_25', test.get('accuracy', 0)):.1%}</div>
-            <div class="stat-label">Hits@25</div>
+            <div class="stat-value">{test.get('hits_at_10', test.get('hits_at_25', 0)):.1%}</div>
+            <div class="stat-label">Hits@10</div>
           </div>
           <div class="stat">
-            <div class="stat-value">{test.get('hits_at_50', 0):.1%}</div>
-            <div class="stat-label">Hits@50</div>
+            <div class="stat-value">{test.get('hits_at_15', test.get('hits_at_50', 0)):.1%}</div>
+            <div class="stat-label">Hits@15</div>
           </div>
           <div class="stat">
             <div class="stat-value">{test.get('mrr', 0):.3f}</div>
@@ -311,8 +310,8 @@ def generate_deck_html(training_log: dict, deck_predictions: dict) -> str:
   <script>
     // Training curves
     const trainLosses = {train_losses_json};
-    const valHits25 = {val_hits25_json};
-    const valF1 = {val_f1_json};
+    const valHits10 = {val_hits10_json};
+    const valHits15 = {val_hits15_json};
     const numEpochs = {num_epochs};
     const bestEpoch = {best_epoch};
 
@@ -355,25 +354,25 @@ def generate_deck_html(training_log: dict, deck_predictions: dict) -> str:
       .attr('fill','none').attr('stroke','#7F77DD').attr('stroke-width',1.5)
       .attr('stroke-opacity',0.5).attr('d', trainLine);
 
-    // Val Hits@25 line
-    if (valHits25.length > 0) {{
-      const hitsLine = d3.line()
+    // Val Hits@10 line
+    if (valHits10.length > 0) {{
+      const hits10Line = d3.line()
         .x((d,i) => xScale(valEpochs[i] || 1))
         .y(d => yMetric(d));
-      svg.append('path').datum(valHits25)
+      svg.append('path').datum(valHits10)
         .attr('fill','none').attr('stroke','#1D9E75').attr('stroke-width',2)
-        .attr('d', hitsLine);
+        .attr('d', hits10Line);
     }}
 
-    // Val F1 line
-    if (valF1.length > 0) {{
-      const f1Line = d3.line()
+    // Val Hits@15 line
+    if (valHits15.length > 0) {{
+      const hits15Line = d3.line()
         .x((d,i) => xScale(valEpochs[i] || 1))
         .y(d => yMetric(d));
-      svg.append('path').datum(valF1)
-        .attr('fill','none').attr('stroke','#BA7517').attr('stroke-width',2)
+      svg.append('path').datum(valHits15)
+        .attr('fill','none').attr('stroke','#3B82F6').attr('stroke-width',2)
         .attr('stroke-dasharray','4,3')
-        .attr('d', f1Line);
+        .attr('d', hits15Line);
     }}
 
     // Best epoch line
@@ -394,7 +393,7 @@ def generate_deck_html(training_log: dict, deck_predictions: dict) -> str:
 
     // Legend
     const legend = svg.append('g').attr('transform', `translate(${{width-180}},5)`);
-    [['BPR Loss','#7F77DD'],['Hits@25','#1D9E75'],['F1','#BA7517'],['Best','#E24B4A']].forEach(([label,color],i) => {{
+    [['BPR Loss','#7F77DD'],['Hits@10','#1D9E75'],['Hits@15','#3B82F6'],['Best','#E24B4A']].forEach(([label,color],i) => {{
       legend.append('rect').attr('x',0).attr('y',i*16).attr('width',12).attr('height',3).attr('fill',color);
       legend.append('text').attr('x',16).attr('y',i*16+4).attr('fill','#888').attr('font-size',10).text(label);
     }});

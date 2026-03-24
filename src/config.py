@@ -64,9 +64,11 @@ DECK_MIN_META_SHARE = float(os.getenv("DECK_MIN_META_SHARE", "5.0"))
 DECK_N_NEGATIVES = int(os.getenv("DECK_N_NEGATIVES", "50"))
 DECK_BPR_MARGIN = float(os.getenv("DECK_BPR_MARGIN", "1.0"))
 DECK_PATIENCE = int(os.getenv("DECK_PATIENCE", "10"))
-DECK_CHECKPOINT_METRIC = os.getenv("DECK_CHECKPOINT_METRIC", "val_hits25")
+DECK_CHECKPOINT_METRIC = os.getenv("DECK_CHECKPOINT_METRIC", "val_hits10")
 DECK_FREEZE_HGT = bool(int(os.getenv("DECK_FREEZE_HGT", "0")))
 DECK_RECENCY_DAYS = int(os.getenv("DECK_RECENCY_DAYS", "30"))
+DECK_WARMUP_EPOCHS = int(os.getenv("DECK_WARMUP_EPOCHS", "5"))
+DECK_LR_SCHEDULER = os.getenv("DECK_LR_SCHEDULER", "cosine")  # cosine | linear | none
 
 # Results — each run gets a timestamped subfolder
 def create_run_dir(task: str | None = None) -> Path:

@@ -6,7 +6,7 @@ belong in which deck archetypes. Key improvements over the original BCE approach
   1. BPR ranking loss — directly optimizes per-archetype card ranking
   2. Leave-one-out archetype pooling — prevents information leakage
   3. Card-level train/val/test split — tests generalization to unseen cards
-  4. Early stopping on Hits@25 — checkpoints on the metric that matters
+  4. Early stopping on Hits@10 — checkpoints on the metric that matters
   5. Recency filter — uses only decklists from the last N days
 """
 
@@ -26,11 +26,13 @@ from src.config import (
     DECK_DROPOUT,
     DECK_FREEZE_HGT,
     DECK_LEARNING_RATE,
+    DECK_LR_SCHEDULER,
     DECK_MIN_META_SHARE,
     DECK_N_NEGATIVES,
     DECK_NUM_EPOCHS,
     DECK_PATIENCE,
     DECK_RECENCY_DAYS,
+    DECK_WARMUP_EPOCHS,
     DECKLISTS_PARQUET,
     GRAPH_PATH,
     HIDDEN_DIM,
@@ -215,13 +217,12 @@ def _evaluate_ranking(
     model, data, node_emb,
     arch_pos_cards: dict[int, list[int]],
     eval_cards: set[int] | None,
-    basic_land_indices: set[int],
     eligible_archetypes: set[int] | None = None,
     k_values: list[int] | None = None,
 ) -> dict:
     """Evaluate ranking quality.
 
-    For each eligible archetype, scores all non-basic-land cards and computes:
+    For each eligible archetype, scores all cards and computes:
       - Hits@K: fraction of target deck cards found in top-K predictions
       - MRR: mean reciprocal rank of target cards
       - F1 at threshold 0.5
@@ -232,12 +233,11 @@ def _evaluate_ranking(
     Returns dict with averaged metrics.
     """
     if k_values is None:
-        k_values = [25, 50]
+        k_values = [10, 15]
 
     card_emb = node_emb["card"]
     arch_emb = node_emb["archetype"]
     n_cards = card_emb.shape[0]
-    basic_lands = basic_land_indices or set()
 
     all_card_indices = torch.arange(n_cards, device=card_emb.device)
     hits_at_k = {k: [] for k in k_values}
@@ -263,10 +263,6 @@ def _evaluate_ranking(
         with torch.no_grad():
             logits = model.predict_deck(card_emb, arch_emb, all_card_indices, arch_indices)
 
-        # Mask basic lands
-        for bl_idx in basic_lands:
-            logits[bl_idx] = float("-inf")
-
         # Hits@K
         for k in k_values:
             top_k_indices = torch.topk(logits, min(k, n_cards)).indices
@@ -283,7 +279,7 @@ def _evaluate_ranking(
 
         # F1 at threshold 0.5
         probs = torch.sigmoid(logits)
-        preds_set = set((probs > 0.5).nonzero(as_tuple=True)[0].cpu().tolist()) - basic_lands
+        preds_set = set((probs > 0.5).nonzero(as_tuple=True)[0].cpu().tolist())
         tp = len(target_positives & preds_set)
         fp = len(preds_set - target_positives)
         fn = len(target_positives - preds_set)
@@ -305,12 +301,14 @@ def _evaluate_ranking(
     return result
 
 
-def train_deck(device=None, **overrides):
+def train_deck(device=None, trial=None, **overrides):
     """Main training loop for deck composition predictor with BPR ranking loss.
 
     Parameters
     ----------
     device : torch.device, optional
+    trial : optuna.trial.Trial, optional
+        When provided, reports intermediate metrics for pruning.
     **overrides : keyword args for hyperparameters
 
     Returns dict with model, data, splits, metrics, and run info.
@@ -332,6 +330,8 @@ def train_deck(device=None, **overrides):
         "checkpoint_metric": overrides.get("checkpoint_metric", DECK_CHECKPOINT_METRIC),
         "freeze_hgt": overrides.get("freeze_hgt", DECK_FREEZE_HGT),
         "recency_days": overrides.get("recency_days", DECK_RECENCY_DAYS),
+        "warmup_epochs": overrides.get("warmup_epochs", DECK_WARMUP_EPOCHS),
+        "lr_scheduler": overrides.get("lr_scheduler", DECK_LR_SCHEDULER),
     }
 
     run_dir = create_run_dir(task="deck")
@@ -395,9 +395,40 @@ def train_deck(device=None, **overrides):
         lr=hp["learning_rate"],
         weight_decay=hp["weight_decay"],
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=hp["num_epochs"]
-    )
+
+    # Build LR scheduler with optional linear warmup
+    warmup_epochs = hp["warmup_epochs"]
+    sched_type = hp["lr_scheduler"].lower()
+    post_warmup_epochs = max(hp["num_epochs"] - warmup_epochs, 1)
+
+    if sched_type == "cosine":
+        base_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=post_warmup_epochs
+        )
+    elif sched_type == "linear":
+        base_scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=1.0, end_factor=0.01,
+            total_iters=post_warmup_epochs,
+        )
+    elif sched_type == "none":
+        base_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _: 1.0)
+    else:
+        raise ValueError(f"Unknown lr_scheduler: {sched_type!r}. Use cosine|linear|none.")
+
+    if warmup_epochs > 0:
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=1e-3, end_factor=1.0,
+            total_iters=warmup_epochs,
+        )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, base_scheduler],
+            milestones=[warmup_epochs],
+        )
+        log.info(f"  LR schedule: {warmup_epochs}-epoch linear warmup → {sched_type} decay")
+    else:
+        scheduler = base_scheduler
+        log.info(f"  LR schedule: {sched_type} (no warmup)")
 
     # Setup evaluation
     arch_names = data["archetype"].names
@@ -405,7 +436,6 @@ def train_deck(device=None, **overrides):
     arch_to_idx = {a: i for i, a in enumerate(arch_names)}
     card_to_idx = {c: i for i, c in enumerate(card_names)}
     eligible_archetypes = _get_eligible_archetypes(arch_to_idx)
-    basic_land_indices = _get_basic_land_indices(card_to_idx)
 
     # Training loop
     best_val_metric = -1.0
@@ -415,8 +445,8 @@ def train_deck(device=None, **overrides):
     val_metrics_history = []
 
     log.info(f"\nTraining for up to {hp['num_epochs']} epochs (patience={hp['patience']})...")
-    log.info(f"{'Epoch':>5} {'BPR Loss':>10} {'Val H@25':>9} {'Val F1':>8} {'Val MRR':>8} {'LR':>10}")
-    log.info("-" * 58)
+    log.info(f"{'Epoch':>5} {'BPR Loss':>10} {'Val H@10':>9} {'Val H@15':>9} {'Val MRR':>8} {'LR':>10}")
+    log.info("-" * 62)
 
     for epoch in range(1, hp["num_epochs"] + 1):
         model.train()
@@ -490,7 +520,7 @@ def train_deck(device=None, **overrides):
                 val_metrics = _evaluate_ranking(
                     model, data, val_emb,
                     arch_pos_cards, None,  # all cards
-                    basic_land_indices, eligible_archetypes,
+                    eligible_archetypes,
                 )
 
             val_metrics_history.append(val_metrics)
@@ -498,17 +528,21 @@ def train_deck(device=None, **overrides):
             lr = scheduler.get_last_lr()[0]
             log.info(
                 f"{epoch:5d} {train_losses[-1]:10.4f} "
-                f"{val_metrics['hits_at_25']:9.3f} "
-                f"{val_metrics['f1']:8.3f} "
+                f"{val_metrics['hits_at_10']:9.3f} "
+                f"{val_metrics['hits_at_15']:9.3f} "
                 f"{val_metrics['mrr']:8.3f} "
                 f"{lr:10.6f}"
             )
 
             # Checkpoint on chosen metric
             metric_key = hp["checkpoint_metric"].replace("val_", "")
-            if metric_key == "hits25":
+            if metric_key == "hits10":
+                metric_key = "hits_at_10"
+            elif metric_key == "hits15":
+                metric_key = "hits_at_15"
+            elif metric_key == "hits25":
                 metric_key = "hits_at_25"
-            current_metric = val_metrics.get(metric_key, val_metrics.get("hits_at_25", 0))
+            current_metric = val_metrics.get(metric_key, val_metrics.get("hits_at_10", 0))
 
             if current_metric > best_val_metric:
                 best_val_metric = current_metric
@@ -521,6 +555,18 @@ def train_deck(device=None, **overrides):
                 }, model_path)
             else:
                 patience_counter += 1
+
+            # Optuna pruning
+            if trial is not None:
+                eval_step = len(val_metrics_history)
+                trial.report(current_metric, eval_step)
+                if trial.should_prune():
+                    log.info(f"\nOptuna pruned trial at epoch {epoch}")
+                    try:
+                        import optuna
+                        raise optuna.TrialPruned()
+                    except ImportError:
+                        break
 
             if patience_counter >= hp["patience"]:
                 log.info(f"\nEarly stopping at epoch {epoch} "
@@ -543,6 +589,7 @@ def train_deck(device=None, **overrides):
         "train_losses": train_losses,
         "val_metrics_history": val_metrics_history,
         "best_epoch": best_epoch,
+        "best_val_metric": best_val_metric,
         "run_dir": run_dir,
         "model_path": model_path,
     }
@@ -570,7 +617,6 @@ def evaluate_deck(
     arch_to_idx = {a: i for i, a in enumerate(arch_names)}
     card_to_idx = {c: i for i, c in enumerate(card_names)}
     eligible_archetypes = _get_eligible_archetypes(arch_to_idx)
-    basic_land_indices = _get_basic_land_indices(card_to_idx)
     log.info(f"  Evaluating {len(eligible_archetypes)} eligible archetypes "
              f"(>= {DECK_MIN_META_SHARE}% meta share)")
 
@@ -583,8 +629,8 @@ def evaluate_deck(
         test_metrics = _evaluate_ranking(
             model, data, node_emb,
             arch_pos_cards, test_cards,
-            basic_land_indices, eligible_archetypes,
-            k_values=[25, 50, 75],
+            eligible_archetypes,
+            k_values=[10, 15, 25],
         )
         for k, v in test_metrics.items():
             log.info(f"  {k}: {v:.3f}")
@@ -594,8 +640,8 @@ def evaluate_deck(
         val_metrics = _evaluate_ranking(
             model, data, node_emb,
             arch_pos_cards, val_cards,
-            basic_land_indices, eligible_archetypes,
-            k_values=[25, 50, 75],
+            eligible_archetypes,
+            k_values=[10, 15, 25],
         )
         for k, v in val_metrics.items():
             log.info(f"  {k}: {v:.3f}")
@@ -607,18 +653,15 @@ def evaluate_deck(
         all_card_indices = torch.arange(n_cards, device=card_emb_all.device)
 
         top_predictions = {}
-        log.info(f"\nTop 10 Predicted Cards per Archetype ({len(eligible_archetypes)} eligible):")
+        log.info(f"\nTop 15 Predicted Cards per Archetype ({len(eligible_archetypes)} eligible):")
         for a_idx, arch_name in enumerate(arch_names):
             if a_idx not in eligible_archetypes:
                 continue
             arch_indices = torch.full((n_cards,), a_idx, dtype=torch.long, device=arch_emb.device)
             logits = model.predict_deck(card_emb_all, arch_emb, all_card_indices, arch_indices)
 
-            for bl_idx in basic_land_indices:
-                logits[bl_idx] = float("-inf")
-
             probs = torch.sigmoid(logits)
-            top_k = torch.topk(probs, 10)
+            top_k = torch.topk(probs, 15)
             pred_cards = [(card_names[i], float(probs[i])) for i in top_k.indices]
             top_predictions[arch_name] = pred_cards
 
@@ -647,7 +690,8 @@ def evaluate_deck(
         },
         "training_curves": {
             "train_losses": train_losses or [],
-            "val_hits25": [m.get("hits_at_25", 0) for m in (val_metrics_history or [])],
+            "val_hits10": [m.get("hits_at_10", 0) for m in (val_metrics_history or [])],
+            "val_hits15": [m.get("hits_at_15", 0) for m in (val_metrics_history or [])],
             "val_f1": [m.get("f1", 0) for m in (val_metrics_history or [])],
             "val_mrr": [m.get("mrr", 0) for m in (val_metrics_history or [])],
         },

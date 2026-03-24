@@ -13,3 +13,6 @@ tqdm>=4.65.0
 
 # Phase 3-4
 torch-geometric>=2.4.0
+
+# Hyperparameter search
+optuna>=3.0.0

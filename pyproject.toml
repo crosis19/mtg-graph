@@ -19,6 +19,7 @@ dependencies = [
     "tqdm>=4.65.0",
     "python-dotenv>=1.0.0",
     "pyarrow>=14.0.0",
+    "optuna>=3.0.0",
 ]
 
 [project.optional-dependencies]
