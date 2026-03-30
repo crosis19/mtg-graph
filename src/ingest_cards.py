@@ -106,25 +106,61 @@ def load_and_filter(path: Path) -> pd.DataFrame:
     return df
 
 
+def _parse_mana_generation(oracle_text: str, type_line: str) -> dict[str, bool]:
+    """Detect which colors of mana a card can produce from oracle text and land types."""
+    import re
+
+    result = {
+        "gen_white": False, "gen_blue": False, "gen_black": False,
+        "gen_red": False, "gen_green": False, "gen_colorless": False,
+    }
+    text = (oracle_text or "").lower()
+    tl = (type_line or "").lower()
+
+    # Basic land types in type line (e.g., "Basic Land — Plains" or dual "Land — Forest Island")
+    if "plains" in tl:
+        result["gen_white"] = True
+    if "island" in tl:
+        result["gen_blue"] = True
+    if "swamp" in tl:
+        result["gen_black"] = True
+    if "mountain" in tl:
+        result["gen_red"] = True
+    if "forest" in tl:
+        result["gen_green"] = True
+
+    # Oracle text patterns: "{T}: Add {W}", "{T}: Add {C}", etc.
+    mana_symbols = re.findall(r"add\s+\{([WUBRGC])\}", text)
+    for sym in mana_symbols:
+        mapping = {"W": "gen_white", "U": "gen_blue", "B": "gen_black",
+                    "R": "gen_red", "G": "gen_green", "C": "gen_colorless"}
+        if sym in mapping:
+            result[mapping[sym]] = True
+
+    # "Add one mana of any color" / "add one mana of any type"
+    if re.search(r"add\s+.*\bany\s+(color|type)\b", text):
+        for key in result:
+            if key != "gen_colorless":
+                result[key] = True
+
+    # "Add {C}" also appears as "add one colorless mana"
+    if re.search(r"add\s+.*\bcolorless\b", text):
+        result["gen_colorless"] = True
+
+    return result
+
+
 def normalize(df: pd.DataFrame) -> pd.DataFrame:
     """Clean and add derived columns."""
-    # Parse color identity from pipe-separated back to count
-    df["color_count"] = df["color_identity"].apply(
-        lambda x: len(x.split("|")) if pd.notna(x) and x else 0
-    )
-
-    # Extract keyword count
-    df["keyword_count"] = df["keywords"].apply(
-        lambda x: len(x.split("|")) if pd.notna(x) and x else 0
-    )
-
     # Clean oracle text — replace None with empty string
     df["oracle_text"] = df["oracle_text"].fillna("")
 
-    # Parse CMC to float
+    # Parse CMC to float and normalize
     df["cmc"] = pd.to_numeric(df["cmc"], errors="coerce").fillna(0.0)
+    max_cmc = df["cmc"].max()
+    df["cmc_norm"] = df["cmc"] / max_cmc if max_cmc > 0 else 0.0
 
-    # Add supertype flags
+    # Card type flags
     df["is_creature"] = df["type_line"].str.contains("Creature", na=False)
     df["is_instant"] = df["type_line"].str.contains("Instant", na=False)
     df["is_sorcery"] = df["type_line"].str.contains("Sorcery", na=False)
@@ -132,6 +168,43 @@ def normalize(df: pd.DataFrame) -> pd.DataFrame:
     df["is_planeswalker"] = df["type_line"].str.contains("Planeswalker", na=False)
     df["is_enchantment"] = df["type_line"].str.contains("Enchantment", na=False)
     df["is_artifact"] = df["type_line"].str.contains("Artifact", na=False)
+    df["is_battle"] = df["type_line"].str.contains("Battle", na=False)
+
+    # Rarity encoding: common/basic=0.25, uncommon=0.5, rare=0.75, mythic=1.0
+    rarity_map = {"common": 0.25, "basic": 0.25, "uncommon": 0.5, "rare": 0.75, "mythic": 1.0}
+    df["rarity_enc"] = df["rarity"].map(rarity_map).fillna(0.25)
+
+    # Color identity flags (parsed from pipe-separated color_identity field)
+    def _parse_colors(ci_str):
+        colors = set(ci_str.split("|")) if pd.notna(ci_str) and ci_str else set()
+        return {
+            "is_white": "W" in colors,
+            "is_blue": "U" in colors,
+            "is_black": "B" in colors,
+            "is_red": "R" in colors,
+            "is_green": "G" in colors,
+            "is_colorless": len(colors) == 0,
+        }
+
+    color_flags = df["color_identity"].apply(_parse_colors).apply(pd.Series)
+    df = pd.concat([df, color_flags], axis=1)
+
+    # Mana generation flags (from oracle text + land type)
+    mana_flags = df.apply(
+        lambda row: _parse_mana_generation(row["oracle_text"], row["type_line"]),
+        axis=1,
+    ).apply(pd.Series)
+    df = pd.concat([df, mana_flags], axis=1)
+
+    # Convert boolean columns to float for downstream tensor construction
+    bool_cols = [
+        "is_creature", "is_instant", "is_sorcery", "is_land", "is_planeswalker",
+        "is_enchantment", "is_artifact", "is_battle",
+        "is_white", "is_blue", "is_black", "is_red", "is_green", "is_colorless",
+        "gen_white", "gen_blue", "gen_black", "gen_red", "gen_green", "gen_colorless",
+    ]
+    for col in bool_cols:
+        df[col] = df[col].astype(float)
 
     return df
 

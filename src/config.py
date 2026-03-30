@@ -26,10 +26,13 @@ MATCHUPS_PARQUET = DATA_PROCESSED / "matchups.parquet"
 
 # Synergy outputs
 KEYWORD_MATRIX_PATH = DATA_PROCESSED / "keyword_matrix.parquet"
-MECHANICAL_EDGES_PATH = DATA_PROCESSED / "mechanical_edges.parquet"
 SEMANTIC_EDGES_PATH = DATA_PROCESSED / "semantic_edges.parquet"
 CARD_EMBEDDINGS_PATH = DATA_EMBEDDINGS / "card_embeddings.npy"
 CARD_EMBEDDING_INDEX_PATH = DATA_EMBEDDINGS / "card_embedding_index.json"
+
+# Card interaction edges (counter/removal)
+COUNTER_EDGES_PATH = DATA_PROCESSED / "counter_edges.parquet"
+REMOVAL_EDGES_PATH = DATA_PROCESSED / "removal_edges.parquet"
 
 # Standard-legal sets filter
 STANDARD_FORMAT = "standard"
@@ -49,32 +52,42 @@ MTGDECKS_WINRATES_URL = os.getenv(
 
 # Graph construction
 GRAPH_PATH = DATA_PROCESSED / "graph.pt"
-COUNTERS_WIN_RATE_THRESHOLD = float(os.getenv("COUNTERS_WIN_RATE_THRESHOLD", "55.0"))
 
-# Model architecture
-HIDDEN_DIM = int(os.getenv("HIDDEN_DIM", "128"))
-NUM_HEADS = int(os.getenv("NUM_HEADS", "4"))
-NUM_HGT_LAYERS = int(os.getenv("NUM_HGT_LAYERS", "3"))
+# ── Model architecture ──
+D_MODEL = int(os.getenv("D_MODEL", "128"))          # shared embedding dim for all nodes
+D_MESSAGE = int(os.getenv("D_MESSAGE", "128"))       # message-passing hidden dim in GNN
+D_COUNT = int(os.getenv("D_COUNT", "16"))            # count embedding dim
+NUM_GNN_LAYERS = int(os.getenv("NUM_GNN_LAYERS", "2"))
+NUM_ATTN_HEADS = int(os.getenv("NUM_ATTN_HEADS", "4"))
+DROPOUT = float(os.getenv("DROPOUT", "0.1"))
+
+# Gumbel-softmax temperature schedule
+GUMBEL_TAU_START = float(os.getenv("GUMBEL_TAU_START", "1.0"))
+GUMBEL_TAU_MIN = float(os.getenv("GUMBEL_TAU_MIN", "0.1"))
+GUMBEL_DECAY = float(os.getenv("GUMBEL_DECAY", "0.01"))
+
+# Loss weights
+COUNT_LOSS_WEIGHT = float(os.getenv("COUNT_LOSS_WEIGHT", "1.0"))
+
+# Deck construction constraints
+MAX_DECK_SIZE = int(os.getenv("MAX_DECK_SIZE", "60"))
+MAX_BASIC_LAND_COUNT = int(os.getenv("MAX_BASIC_LAND_COUNT", "20"))
+MAX_NONBASIC_COUNT = int(os.getenv("MAX_NONBASIC_COUNT", "4"))
 
 # Training hyperparameters
-WEIGHT_DECAY = float(os.getenv("WEIGHT_DECAY", "0.0001"))
-TRAIN_SPLIT_RATIO = float(os.getenv("TRAIN_SPLIT_RATIO", "0.6"))
-VAL_SPLIT_RATIO = float(os.getenv("VAL_SPLIT_RATIO", "0.2"))
-# Test split is implicit: 1.0 - TRAIN_SPLIT_RATIO - VAL_SPLIT_RATIO
-
-# Deck predictor hyperparameters
-DECK_LEARNING_RATE = float(os.getenv("DECK_LEARNING_RATE", "0.001"))
+DECK_LEARNING_RATE = float(os.getenv("DECK_LEARNING_RATE", "0.0001"))
+WEIGHT_DECAY = float(os.getenv("WEIGHT_DECAY", "0.00001"))
 DECK_NUM_EPOCHS = int(os.getenv("DECK_NUM_EPOCHS", "50"))
-DECK_DROPOUT = float(os.getenv("DECK_DROPOUT", "0.3"))
-DECK_MIN_META_SHARE = float(os.getenv("DECK_MIN_META_SHARE", "5.0"))
-DECK_N_NEGATIVES = int(os.getenv("DECK_N_NEGATIVES", "50"))
-DECK_BPR_MARGIN = float(os.getenv("DECK_BPR_MARGIN", "1.0"))
 DECK_PATIENCE = int(os.getenv("DECK_PATIENCE", "10"))
-DECK_CHECKPOINT_METRIC = os.getenv("DECK_CHECKPOINT_METRIC", "val_hits10")
-DECK_FREEZE_HGT = bool(int(os.getenv("DECK_FREEZE_HGT", "0")))
 DECK_RECENCY_DAYS = int(os.getenv("DECK_RECENCY_DAYS", "30"))
 DECK_WARMUP_EPOCHS = int(os.getenv("DECK_WARMUP_EPOCHS", "5"))
 DECK_LR_SCHEDULER = os.getenv("DECK_LR_SCHEDULER", "cosine")  # cosine | linear | none
+DECK_NUM_ARCHETYPES = int(os.getenv("DECK_NUM_ARCHETYPES", "16"))
+DECK_NUM_VAL_ARCHETYPES = int(os.getenv("DECK_NUM_VAL_ARCHETYPES", "3"))
+DECK_NUM_CV_FOLDS = int(os.getenv("DECK_NUM_CV_FOLDS", "5"))
+
+# Legacy: still used by graph_builder for copy-count edge weight encoding
+DECK_BASIC_LAND_MAX_COPIES = int(os.getenv("DECK_BASIC_LAND_MAX_COPIES", "20"))
 
 # Results — each run gets a timestamped subfolder
 def create_run_dir(task: str | None = None) -> Path:

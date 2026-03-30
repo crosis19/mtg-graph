@@ -1,25 +1,25 @@
 """Phase 3: Build a PyTorch Geometric HeteroData graph from all processed data.
 
 Assembles three node types (Card, Archetype, Set) and multiple edge types
-into a single heterogeneous graph suitable for HGT training.
+into a single heterogeneous graph suitable for GNN training.
 
 Node types:
-  - card:       ~4,168 Standard-legal cards with numeric features
-  - archetype:  ~5-10 meta archetypes (>= DECK_MIN_META_SHARE%) with metagame features
-  - set:        ~12-16 Standard-legal sets with release/rotation features
+  - card:       ~4,168 Standard-legal cards (407-dim: 384 embedding + 23 scalar)
+  - archetype:  ~10 meta archetypes (14-dim: 6 color flags + 8 type ratios)
+  - set:        ~12-16 Standard-legal sets (385-dim: 384 avg embedding + 1 recency)
 
 Edge types (11):
-  - (card, keyword_synergy, card)        — complementary keywords
-  - (card, mechanical_synergy, card)     — trigger/enabler patterns
-  - (card, semantic_synergy, card)       — embedding similarity
-  - (archetype, maindecks, card)         — mainboard inclusion (edge_attr: copies, inclusion_pct)
-  - (card, maindeck_of, archetype)       — reverse
-  - (archetype, sideboards, card)        — sideboard inclusion (edge_attr: copies, inclusion_pct)
-  - (card, sideboard_of, archetype)      — reverse
-  - (archetype, counters, archetype)     — favorable matchup (directed)
-  - (archetype, countered_by, archetype) — reverse
-  - (set, printed_in, card)              — set contains this card
-  - (card, from_set, set)               — reverse
+  - (card, keyword_synergy, card)        — complementary keywords (undirected)
+  - (card, semantic_synergy, card)       — embedding similarity (undirected)
+  - (card, counters, card)               — card counters another card (directed)
+  - (card, countered_by, card)           — reverse of counters
+  - (card, removes, card)                — card removes another card (directed)
+  - (card, removed_by, card)             — reverse of removes
+  - (set, printed_in, card)              — set contains this card (directed)
+  - (archetype, contains, card)          — deck includes this card (directed)
+  - (card, in_deck, archetype)           — reverse of contains
+  - (archetype, win_rate, archetype)     — source's win rate vs target (directed)
+  - (archetype, lose_rate, archetype)    — source's loss rate vs target (directed)
 
 Outputs:
   - data/processed/graph.pt  (serialized HeteroData)
@@ -38,14 +38,15 @@ from src.config import (
     CARD_EMBEDDINGS_PATH,
     CARD_EMBEDDING_INDEX_PATH,
     CARDS_PARQUET,
-    COUNTERS_WIN_RATE_THRESHOLD,
-    DECK_MIN_META_SHARE,
+    COUNTER_EDGES_PATH,
+    DECK_BASIC_LAND_MAX_COPIES,
+    DECK_NUM_ARCHETYPES,
     DECKLISTS_PARQUET,
     GRAPH_PATH,
     KEYWORD_MATRIX_PATH,
     MATCHUPS_PARQUET,
-    MECHANICAL_EDGES_PATH,
     METAGAME_PARQUET,
+    REMOVAL_EDGES_PATH,
     SEMANTIC_EDGES_PATH,
 )
 
@@ -53,9 +54,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger(__name__)
 
 # ── Standard-legal sets: authoritative list from whatsinstandard.com ──
-# Only these set codes get Set nodes. Everything else is either rotated out
-# or a Scryfall printing artifact (reprint tagged to its original set).
-# Source: https://whatsinstandard.com/api/v6/standard.json (as of 2026-03-16)
 STANDARD_LEGAL_SET_CODES = {
     "woe",   # Wilds of Eldraine
     "lci",   # The Lost Caverns of Ixalan
@@ -75,65 +73,58 @@ STANDARD_LEGAL_SET_CODES = {
     "tmt",   # Teenage Mutant Ninja Turtles
 }
 
-# ── Banned cards in Standard (as of 2026-03-16) ──
-# Source: whatsinstandard.com
-BANNED_CARDS = {
-    "Heartfire Hero",
-    "Screaming Nemesis",
-    "Cori-Steel Cutter",
-    "Vivi Ornitier",
-}
+# ── Basic land names ──
+BASIC_LAND_NAMES = {"Plains", "Island", "Swamp", "Mountain", "Forest"}
 
 
 def _load_cards() -> tuple[pd.DataFrame, dict, torch.Tensor]:
     """Load card data and build card node features.
 
     Returns (cards_df, card_name_to_idx, card_features_tensor).
-    Card features: [384-dim embedding + 11 numeric].
-    set_recency is no longer a card feature — it lives on the Set node.
-    is_banned flags cards currently banned in Standard.
+    Card features: [384-dim embedding + 23 scalar].
+
+    Scalar features (23):
+      cmc_norm, is_creature, is_instant, is_sorcery, is_land, is_planeswalker,
+      is_enchantment, is_artifact, is_battle, rarity_enc,
+      is_white, is_blue, is_black, is_red, is_green, is_colorless,
+      gen_white, gen_blue, gen_black, gen_red, gen_green, gen_colorless
     """
     cards = pd.read_parquet(CARDS_PARQUET)
+
+    # Sort so per-card output neurons have structured locality:
+    # color identity → card type → CMC → set → name
+    cards = cards.sort_values(
+        by=["color_identity", "type_line", "cmc", "set", "name"],
+        na_position="last",
+    ).reset_index(drop=True)
+
     card_name_to_idx = {name: i for i, name in enumerate(cards["name"])}
 
-    # Load pre-computed 384-dim embeddings as primary card features
+    # Load pre-computed 384-dim embeddings
     embeddings = np.load(CARD_EMBEDDINGS_PATH)
     with open(CARD_EMBEDDING_INDEX_PATH) as f:
         emb_index = json.load(f)
     emb_name_to_idx = {name: i for i, name in enumerate(emb_index)}
 
-    # Build feature matrix: [embedding(384) + numeric(10)]
-    # Note: is_instant and is_sorcery are separate features (mechanically distinct)
     n_cards = len(cards)
     emb_dim = embeddings.shape[1]
 
-    # Handle backward compatibility: if cards.parquet still has old column
-    if "is_instant_sorcery" in cards.columns and "is_instant" not in cards.columns:
-        cards["is_instant"] = cards["type_line"].str.contains("Instant", na=False)
-        cards["is_sorcery"] = cards["type_line"].str.contains("Sorcery", na=False)
-
-    # Add banned flag: 1.0 if the card is banned in Standard, 0.0 otherwise
-    cards["is_banned"] = cards["name"].isin(BANNED_CARDS).astype(np.float32)
-    n_banned = int(cards["is_banned"].sum())
-    if n_banned > 0:
-        banned_names = cards.loc[cards["is_banned"] == 1.0, "name"].tolist()
-        log.info(f"  Banned cards flagged ({n_banned}): {', '.join(banned_names)}")
-
     numeric_cols = [
-        "cmc", "color_count", "keyword_count",
+        "cmc_norm",
         "is_creature", "is_instant", "is_sorcery", "is_land",
-        "is_planeswalker", "is_enchantment", "is_artifact",
-        "is_banned",
+        "is_planeswalker", "is_enchantment", "is_artifact", "is_battle",
+        "rarity_enc",
+        "is_white", "is_blue", "is_black", "is_red", "is_green", "is_colorless",
+        "gen_white", "gen_blue", "gen_black", "gen_red", "gen_green", "gen_colorless",
     ]
 
-    numeric = cards[numeric_cols].values.astype(np.float32)
+    # Verify all columns exist
+    missing = [c for c in numeric_cols if c not in cards.columns]
+    if missing:
+        raise ValueError(f"Missing columns in cards.parquet: {missing}. "
+                         f"Re-run ingest_cards.py to generate new features.")
 
-    # Normalize numeric features
-    for col_idx in range(numeric.shape[1]):
-        col = numeric[:, col_idx]
-        col_max = col.max()
-        if col_max > 0:
-            numeric[:, col_idx] = col / col_max
+    numeric = cards[numeric_cols].values.astype(np.float32)
 
     features = np.zeros((n_cards, emb_dim + len(numeric_cols)), dtype=np.float32)
     for i, name in enumerate(cards["name"]):
@@ -141,35 +132,31 @@ def _load_cards() -> tuple[pd.DataFrame, dict, torch.Tensor]:
             features[i, :emb_dim] = embeddings[emb_name_to_idx[name]]
         features[i, emb_dim:] = numeric[i]
 
-    log.info(f"  Card features: {features.shape} (384 embedding + {len(numeric_cols)} numeric)")
+    log.info(f"  Card features: {features.shape} (384 embedding + {len(numeric_cols)} scalar)")
     return cards, card_name_to_idx, torch.tensor(features)
 
 
-def _load_sets(cards: pd.DataFrame) -> tuple[list, dict, torch.Tensor]:
-    """Build Set nodes from the card pool.
+def _load_sets(
+    cards: pd.DataFrame,
+    card_embeddings: np.ndarray,
+    card_emb_name_to_idx: dict[str, int],
+) -> tuple[list, list, dict, torch.Tensor]:
+    """Build Set nodes with average card embedding + recency features.
 
-    Only includes sets in STANDARD_LEGAL_SET_CODES (authoritative whitelist
-    from whatsinstandard.com). Cards from non-Standard sets are Scryfall
-    printing artifacts — those cards won't get set edges but still exist
-    as card nodes.
-
-    Features: [set_recency, set_size_norm, avg_cmc_norm]
-      - set_recency: normalized release date (0=oldest in Standard, 1=newest)
-      - set_size_norm: number of cards in this set / max set size
-      - avg_cmc_norm: average CMC of cards in this set / max avg CMC
+    Features per set (385-dim):
+      - semantic_embedding_avg (384): mean of card embeddings in this set
+      - set_recency (1): normalized release date [0=oldest, 1=newest]
 
     Returns (set_codes, set_names, set_code_to_idx, set_features_tensor).
     """
-    # Get unique sets and their properties
     set_info = []
     skipped_sets = []
+
     for set_code in cards["set"].unique():
         set_cards = cards[cards["set"] == set_code]
         set_name = set_cards["set_name"].iloc[0] if "set_name" in set_cards.columns else set_code
         n_cards = len(set_cards)
-        avg_cmc = set_cards["cmc"].mean() if "cmc" in set_cards.columns else 0.0
 
-        # Get release date from first card in the set
         release_date = None
         if "released_at" in set_cards.columns:
             dates = pd.to_datetime(set_cards["released_at"], errors="coerce")
@@ -177,30 +164,31 @@ def _load_sets(cards: pd.DataFrame) -> tuple[list, dict, torch.Tensor]:
             if len(valid_dates) > 0:
                 release_date = valid_dates.iloc[0]
 
-        # Filter: only sets in the Standard-legal whitelist
         if set_code.lower() not in STANDARD_LEGAL_SET_CODES:
             skipped_sets.append((set_code, set_name, n_cards, release_date))
             continue
+
+        # Compute average card embedding for this set
+        emb_list = []
+        for card_name in set_cards["name"]:
+            if card_name in card_emb_name_to_idx:
+                emb_list.append(card_embeddings[card_emb_name_to_idx[card_name]])
+        avg_emb = np.mean(emb_list, axis=0) if emb_list else np.zeros(card_embeddings.shape[1])
 
         set_info.append({
             "set_code": set_code,
             "set_name": set_name,
             "n_cards": n_cards,
-            "avg_cmc": avg_cmc,
             "release_date": release_date,
+            "avg_embedding": avg_emb,
         })
 
     if skipped_sets:
         n_cards_skipped = sum(s[2] for s in skipped_sets)
         log.info(f"  Skipped {len(skipped_sets)} non-Standard sets "
-                 f"({n_cards_skipped} cards without set edges):")
-        for code, name, count, date in skipped_sets:
-            date_str = date.strftime("%Y-%m-%d") if pd.notna(date) else "?"
-            log.info(f"    {code:6s} {name:40s} cards={count}  released={date_str}")
+                 f"({n_cards_skipped} cards without set edges)")
 
     set_df = pd.DataFrame(set_info)
-
-    # Sort by release date for consistent ordering
     set_df["release_date"] = pd.to_datetime(set_df["release_date"], errors="coerce")
     set_df = set_df.sort_values("release_date", na_position="first").reset_index(drop=True)
 
@@ -208,10 +196,10 @@ def _load_sets(cards: pd.DataFrame) -> tuple[list, dict, torch.Tensor]:
     set_names = set_df["set_name"].tolist()
     set_code_to_idx = {code: i for i, code in enumerate(set_codes)}
 
-    # Build features
+    # Build features: [avg_embedding(384), set_recency(1)]
     n_sets = len(set_codes)
+    emb_dim = card_embeddings.shape[1]
 
-    # set_recency: normalized release date ordinal [0, 1]
     release_dates = set_df["release_date"]
     min_date = release_dates.min()
     max_date = release_dates.max()
@@ -220,24 +208,95 @@ def _load_sets(cards: pd.DataFrame) -> tuple[list, dict, torch.Tensor]:
         date_range = 1
     recency = ((release_dates - min_date).dt.days / date_range).fillna(0.5).values.astype(np.float32)
 
-    # set_size_norm: card count normalized
-    sizes = set_df["n_cards"].values.astype(np.float32)
-    max_size = sizes.max() if sizes.max() > 0 else 1.0
-    sizes_norm = sizes / max_size
+    features = np.zeros((n_sets, emb_dim + 1), dtype=np.float32)
+    for i in range(n_sets):
+        features[i, :emb_dim] = set_df.iloc[i]["avg_embedding"]
+        features[i, emb_dim] = recency[i]
 
-    # avg_cmc_norm
-    avg_cmcs = set_df["avg_cmc"].values.astype(np.float32)
-    max_avg_cmc = avg_cmcs.max() if avg_cmcs.max() > 0 else 1.0
-    avg_cmcs_norm = avg_cmcs / max_avg_cmc
-
-    features = np.stack([recency, sizes_norm, avg_cmcs_norm], axis=1)
-
-    log.info(f"  Set features: {features.shape} (recency, size, avg_cmc) — {n_sets} sets")
-    for i, (code, name) in enumerate(zip(set_codes, set_names)):
-        date_str = set_df["release_date"].iloc[i].strftime("%Y-%m-%d") if pd.notna(set_df["release_date"].iloc[i]) else "?"
-        log.info(f"    [{i}] {code:6s} {name:35s} released={date_str}  cards={int(sizes[i]):3d}  recency={recency[i]:.2f}")
-
+    log.info(f"  Set features: {features.shape} (384 avg embedding + 1 recency) — {n_sets} sets")
     return set_codes, set_names, set_code_to_idx, torch.tensor(features)
+
+
+def _load_archetypes(
+    metagame: pd.DataFrame,
+    decklists: pd.DataFrame,
+    cards_df: pd.DataFrame,
+) -> tuple[list, dict, torch.Tensor]:
+    """Build archetype nodes with color flags and type ratios.
+
+    Features per archetype (14-dim):
+      - contains_white, contains_blue, contains_black, contains_red,
+        contains_green, contains_colorless (6 binary)
+      - creature_ratio, instant_ratio, sorcery_ratio, land_ratio,
+        planeswalker_ratio, enchantment_ratio, artifact_ratio, battle_ratio (8 continuous)
+
+    Returns (archetype_names, arch_name_to_idx, arch_features_tensor).
+    """
+    latest = metagame.sort_values("snapshot_date").groupby("archetype").last().reset_index()
+
+    # Take top N archetypes by meta share (no minimum threshold)
+    latest = latest.dropna(subset=["meta_share_pct"])
+    latest = latest.nlargest(DECK_NUM_ARCHETYPES, "meta_share_pct")
+    archetype_names = sorted(latest["archetype"].tolist())
+    log.info(f"  {len(archetype_names)} archetypes (top {DECK_NUM_ARCHETYPES} by meta share)")
+    arch_name_to_idx = {name: i for i, name in enumerate(archetype_names)}
+
+    # Card color identity lookup
+    card_colors: dict[str, set[str]] = {}
+    card_types: dict[str, str] = {}
+    for _, row in cards_df.iterrows():
+        ci = row.get("color_identity")
+        card_colors[row["name"]] = set(ci.split("|")) if pd.notna(ci) and ci else set()
+        card_types[row["name"]] = str(row.get("type_line", ""))
+
+    n_archetypes = len(archetype_names)
+    features = np.zeros((n_archetypes, 14), dtype=np.float32)
+
+    for arch in archetype_names:
+        idx = arch_name_to_idx[arch]
+        arch_cards = decklists.loc[decklists["archetype"] == arch, "card_name"].unique()
+        n_cards = max(len(arch_cards), 1)
+
+        # Color presence flags
+        all_colors = set()
+        type_counts = {
+            "Creature": 0, "Instant": 0, "Sorcery": 0, "Land": 0,
+            "Planeswalker": 0, "Enchantment": 0, "Artifact": 0, "Battle": 0,
+        }
+
+        for card_name in arch_cards:
+            all_colors |= card_colors.get(card_name, set())
+            tl = card_types.get(card_name, "")
+            for t in type_counts:
+                if t in tl:
+                    type_counts[t] += 1
+
+        # Color flags (6)
+        features[idx, 0] = float("W" in all_colors)
+        features[idx, 1] = float("U" in all_colors)
+        features[idx, 2] = float("B" in all_colors)
+        features[idx, 3] = float("R" in all_colors)
+        features[idx, 4] = float("G" in all_colors)
+        # contains_colorless: has colorless non-land cards
+        has_colorless = any(
+            len(card_colors.get(c, set())) == 0 and "Land" not in card_types.get(c, "")
+            for c in arch_cards
+        )
+        features[idx, 5] = float(has_colorless)
+
+        # Type ratios (8)
+        features[idx, 6] = type_counts["Creature"] / n_cards
+        features[idx, 7] = type_counts["Instant"] / n_cards
+        features[idx, 8] = type_counts["Sorcery"] / n_cards
+        features[idx, 9] = type_counts["Land"] / n_cards
+        features[idx, 10] = type_counts["Planeswalker"] / n_cards
+        features[idx, 11] = type_counts["Enchantment"] / n_cards
+        features[idx, 12] = type_counts["Artifact"] / n_cards
+        features[idx, 13] = type_counts["Battle"] / n_cards
+
+    features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+    log.info(f"  Archetype features: {features.shape} (6 color flags + 8 type ratios)")
+    return archetype_names, arch_name_to_idx, torch.tensor(features)
 
 
 def _build_set_card_edges(
@@ -245,11 +304,7 @@ def _build_set_card_edges(
     card_name_to_idx: dict,
     set_code_to_idx: dict,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build set -> card 'printed_in' edges.
-
-    Every card is connected to its set. Weight is uniform (1.0) since
-    membership is binary — a card either is or isn't in the set.
-    """
+    """Build set -> card 'printed_in' edges (directed, weight=1.0)."""
     src_list, dst_list = [], []
     for _, row in cards.iterrows():
         card = row["name"]
@@ -265,115 +320,14 @@ def _build_set_card_edges(
     return edge_index, edge_weight
 
 
-def _load_archetypes(
-    metagame: pd.DataFrame,
-    decklists: pd.DataFrame,
-    cards_df: pd.DataFrame,
-    card_embeddings: np.ndarray,
-    card_emb_name_to_idx: dict[str, int],
-) -> tuple[list, dict, torch.Tensor]:
-    """Build archetype nodes from metagame data with rich features.
-
-    Features per archetype (~390-dim):
-      - meta_share (1): normalized meta share percentage
-      - n_colors / 5 (1): number of colors in the archetype's identity
-      - mean_card_embedding (384): average card embedding across deck cards
-      - creature_ratio (1): fraction of deck that's creatures
-      - spell_ratio (1): fraction of deck that's instants/sorceries
-      - avg_cmc / 7 (1): average converted mana cost
-      - cmc_variance / 10 (1): variance of CMC across deck cards
-
-    Returns (archetype_names, arch_name_to_idx, arch_features_tensor).
-    """
-    # Get latest snapshot per archetype, filtered by meta share threshold
-    latest = metagame.sort_values("snapshot_date").groupby("archetype").last().reset_index()
-    latest = latest[latest["meta_share_pct"] >= DECK_MIN_META_SHARE]
-    archetype_names = sorted(latest["archetype"].tolist())
-    log.info(f"  {len(archetype_names)} archetypes with >= {DECK_MIN_META_SHARE}% meta share")
-    arch_name_to_idx = {name: i for i, name in enumerate(archetype_names)}
-
-    # ── Derive color identity from decklist cards ──
-    card_colors: dict[str, set[str]] = {}
-    for _, row in cards_df.iterrows():
-        ci = row.get("color_identity")
-        if pd.notna(ci) and ci:
-            card_colors[row["name"]] = set(ci.split("|"))
-        else:
-            card_colors[row["name"]] = set()
-
-    # ── Per-archetype stats from decklists ──
-    emb_dim = card_embeddings.shape[1]
-    n_archetypes = len(archetype_names)
-    n_scalar = 6  # meta_share, n_colors, creature_ratio, spell_ratio, avg_cmc, cmc_var
-    feature_dim = n_scalar + emb_dim
-
-    features = np.zeros((n_archetypes, feature_dim), dtype=np.float32)
-
-    for arch in archetype_names:
-        idx = arch_name_to_idx[arch]
-        arch_cards = decklists.loc[decklists["archetype"] == arch, "card_name"].unique()
-
-        # Color identity
-        colors = set()
-        for card_name in arch_cards:
-            colors |= card_colors.get(card_name, set())
-        features[idx, 1] = len(colors) / 5.0
-
-        # Mean card embedding
-        emb_list = []
-        cmcs = []
-        n_creatures = 0
-        n_spells = 0
-        for card_name in arch_cards:
-            if card_name in card_emb_name_to_idx:
-                emb_list.append(card_embeddings[card_emb_name_to_idx[card_name]])
-            card_row = cards_df.loc[cards_df["name"] == card_name]
-            if card_row.empty:
-                continue
-            card_row = card_row.iloc[0]
-            if pd.notna(card_row.get("cmc")):
-                cmcs.append(float(card_row["cmc"]))
-            type_line = str(card_row.get("type_line", ""))
-            if "Creature" in type_line:
-                n_creatures += 1
-            if "Instant" in type_line or "Sorcery" in type_line:
-                n_spells += 1
-
-        n_cards = max(len(arch_cards), 1)
-        features[idx, 2] = n_creatures / n_cards  # creature_ratio
-        features[idx, 3] = n_spells / n_cards      # spell_ratio
-        if cmcs:
-            features[idx, 4] = np.mean(cmcs) / 7.0  # avg_cmc
-            features[idx, 5] = np.var(cmcs) / 10.0   # cmc_variance
-        if emb_list:
-            features[idx, n_scalar:] = np.mean(emb_list, axis=0)
-
-    # Fill meta_share from metagame data
-    for _, row in latest.iterrows():
-        idx = arch_name_to_idx[row["archetype"]]
-        if pd.notna(row.get("meta_share_pct")):
-            features[idx, 0] = row["meta_share_pct"] / 100.0
-
-    features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
-
-    log.info(f"  Archetype features: {features.shape} "
-             f"({n_scalar} scalar + {emb_dim} mean embedding)")
-    log.info(f"  NaN check: {np.isnan(features).sum()} NaN remaining")
-    return archetype_names, arch_name_to_idx, torch.tensor(features)
-
-
-
-def _build_card_synergy_edges(
-    card_name_to_idx: dict,
-) -> dict:
-    """Load all three synergy layers and build edge index tensors.
+def _build_card_synergy_edges(card_name_to_idx: dict) -> dict:
+    """Load keyword and semantic synergy edges.
 
     Returns dict of {edge_type_str: (edge_index, edge_weight)}.
     """
     edges = {}
     synergy_files = [
         (KEYWORD_MATRIX_PATH, "keyword_synergy", "synergy_count"),
-        (MECHANICAL_EDGES_PATH, "mechanical_synergy", "synergy_count"),
         (SEMANTIC_EDGES_PATH, "semantic_synergy", "similarity"),
     ]
 
@@ -404,7 +358,6 @@ def _build_card_synergy_edges(
         if src_list:
             edge_index = torch.tensor([src_list, dst_list], dtype=torch.long)
             edge_weight = torch.tensor(weight_list, dtype=torch.float32)
-            # Normalize weights to [0, 1]
             if edge_weight.max() > 0:
                 edge_weight = edge_weight / edge_weight.max()
             edges[edge_type] = (edge_index, edge_weight)
@@ -415,78 +368,108 @@ def _build_card_synergy_edges(
     return edges
 
 
+def _build_card_interaction_edges(card_name_to_idx: dict) -> dict:
+    """Load counter and removal edges between cards.
+
+    Returns dict of {edge_type_str: (edge_index, edge_weight)}.
+    Creates bidirectional pairs: counters/countered_by and removes/removed_by.
+    """
+    edges = {}
+    interaction_files = [
+        (COUNTER_EDGES_PATH, "counters", "countered_by"),
+        (REMOVAL_EDGES_PATH, "removes", "removed_by"),
+    ]
+
+    for path, forward_type, reverse_type in interaction_files:
+        if not path.exists():
+            log.warning(f"  {forward_type}: file not found at {path}, skipping")
+            continue
+
+        df = pd.read_parquet(path)
+        fwd_src, fwd_dst = [], []
+        skipped = 0
+
+        for _, row in df.iterrows():
+            source = row["source_card"]
+            target = row["target_card"]
+            if source not in card_name_to_idx or target not in card_name_to_idx:
+                skipped += 1
+                continue
+            fwd_src.append(card_name_to_idx[source])
+            fwd_dst.append(card_name_to_idx[target])
+
+        if fwd_src:
+            fwd_index = torch.tensor([fwd_src, fwd_dst], dtype=torch.long)
+            fwd_weight = torch.ones(fwd_index.shape[1], dtype=torch.float32)
+            edges[forward_type] = (fwd_index, fwd_weight)
+
+            # Reverse
+            rev_index = torch.stack([fwd_index[1], fwd_index[0]])
+            edges[reverse_type] = (rev_index, fwd_weight.clone())
+
+            log.info(f"  {forward_type}: {fwd_index.shape[1]} edges "
+                     f"(skipped {skipped} unknown cards)")
+        else:
+            log.warning(f"  {forward_type}: no valid edges!")
+
+    return edges
+
+
 def _build_deck_edges(
     decklists: pd.DataFrame,
     card_name_to_idx: dict,
     arch_name_to_idx: dict,
-) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
-    """Build archetype -> card deck edges, split by mainboard/sideboard.
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build archetype -> card 'contains' edges from mainboard only.
 
-    Returns dict mapping edge_type_name to (edge_index, edge_attr).
-    edge_attr is (num_edges, 2): [avg_copies/4.0, inclusion_pct].
+    Edge weight encodes copy count:
+      - Non-basic cards: 0.25=1, 0.5=2, 0.75=3, 1.0=4+
+      - Basic lands: actual_count / DECK_BASIC_LAND_MAX_COPIES
+
+    Returns (edge_index, edge_weight).
     """
-    results = {}
-
-    if "board" not in decklists.columns:
-        log.warning("  'board' column missing from decklists — treating all as mainboard. "
-                    "Re-run Phase 1 scraping to get main/side split.")
-        boards = {"maindecks": decklists}
-    else:
-        boards = {
-            "maindecks": decklists[decklists["board"] == "main"],
-            "sideboards": decklists[decklists["board"] == "side"],
-        }
-
-    # Detect column names (new schema: avg_copies/inclusion_pct, old: copies)
+    # Detect column names
     has_new_schema = "avg_copies" in decklists.columns
     copies_col = "avg_copies" if has_new_schema else "copies"
 
-    for edge_name, board_df in boards.items():
-        if board_df.empty:
-            log.warning(f"  {edge_name}: no data, creating empty edge set")
-            results[edge_name] = (
-                torch.zeros((2, 0), dtype=torch.long),
-                torch.zeros((0, 2), dtype=torch.float32),
-            )
+    # Filter to mainboard only — sideboard cards can confuse core deck identity
+    if "board" in decklists.columns:
+        decklists = decklists[decklists["board"] == "main"]
+        log.info(f"  Filtered to mainboard: {len(decklists)} decklist rows")
+
+    # Aggregate copies per archetype-card pair
+    agg = (
+        decklists.groupby(["archetype", "card_name"])[copies_col]
+        .max()
+        .reset_index()
+    )
+
+    src_list, dst_list, weight_list = [], [], []
+    for _, row in agg.iterrows():
+        arch = row["archetype"]
+        card = row["card_name"]
+        if arch not in arch_name_to_idx or card not in card_name_to_idx:
             continue
 
-        # Group by (archetype, card_name) — may already be unique per new schema
-        agg = (
-            board_df.groupby(["archetype", "card_name"])[copies_col]
-            .mean()
-            .reset_index()
-        )
-        # Get inclusion_pct if available
-        if has_new_schema and "inclusion_pct" in board_df.columns:
-            incl = (
-                board_df.groupby(["archetype", "card_name"])["inclusion_pct"]
-                .mean()
-                .reset_index()
-            )
-            agg = agg.merge(incl, on=["archetype", "card_name"], how="left")
-            agg["inclusion_pct"] = agg["inclusion_pct"].fillna(1.0)
+        copies = float(row[copies_col])
+        is_basic = card in BASIC_LAND_NAMES
+
+        if is_basic:
+            # Uncapped encoding for basic lands
+            weight = min(copies / DECK_BASIC_LAND_MAX_COPIES, 1.0)
         else:
-            agg["inclusion_pct"] = 1.0
+            # Encode copy count: 1→0.25, 2→0.5, 3→0.75, 4+→1.0
+            copies_clamped = min(max(round(copies), 1), 4)
+            weight = copies_clamped * 0.25
 
-        src_list, dst_list, attr_copies, attr_incl = [], [], [], []
-        for _, row in agg.iterrows():
-            arch = row["archetype"]
-            card = row["card_name"]
-            if arch not in arch_name_to_idx or card not in card_name_to_idx:
-                continue
-            src_list.append(arch_name_to_idx[arch])
-            dst_list.append(card_name_to_idx[card])
-            attr_copies.append(float(row[copies_col]) / 4.0)
-            attr_incl.append(float(row["inclusion_pct"]))
+        src_list.append(arch_name_to_idx[arch])
+        dst_list.append(card_name_to_idx[card])
+        weight_list.append(weight)
 
-        edge_index = torch.tensor([src_list, dst_list], dtype=torch.long)
-        edge_attr = torch.tensor(
-            list(zip(attr_copies, attr_incl)), dtype=torch.float32
-        )  # (n_edges, 2)
-        log.info(f"  {edge_name}: {edge_index.shape[1]} edges (archetype -> card)")
-        results[edge_name] = (edge_index, edge_attr)
-
-    return results
+    edge_index = torch.tensor([src_list, dst_list], dtype=torch.long)
+    edge_weight = torch.tensor(weight_list, dtype=torch.float32)
+    log.info(f"  contains: {edge_index.shape[1]} edges (archetype -> card)")
+    return edge_index, edge_weight
 
 
 def _fuzzy_match_archetypes(
@@ -496,9 +479,7 @@ def _fuzzy_match_archetypes(
 ) -> dict[str, int]:
     """Build a mapping from matchup archetype names to graph node indices.
 
-    Tries exact match first, then falls back to fuzzy matching that requires
-    the color identity (first word) to match. This prevents false positives
-    like 'Mardu Midrange' → 'Dimir Midrange'.
+    Tries exact match first, then fuzzy matching requiring color identity match.
     """
     from difflib import SequenceMatcher
 
@@ -509,16 +490,13 @@ def _fuzzy_match_archetypes(
         return s.lower().replace("-", " ").strip()
 
     def _color_word(s: str) -> str:
-        """Extract the color identity prefix (e.g., 'mono green', 'izzet')."""
         return _normalize(s).split()[0] if s.strip() else ""
 
     for name in matchup_names:
-        # Exact match
         if name in graph_names:
             mapping[name] = graph_names[name]
             continue
 
-        # Fuzzy match: require the color identity word to match
         name_color = _color_word(name)
         best_match = None
         best_score = 0.0
@@ -526,11 +504,8 @@ def _fuzzy_match_archetypes(
 
         for gname in graph_names:
             gname_color = _color_word(gname)
-
-            # Color identity must match (izzet=izzet, mono=mono, dimir=dimir)
             if name_color != gname_color:
                 continue
-
             gname_norm = _normalize(gname)
             score = SequenceMatcher(None, name_norm, gname_norm).ratio()
             if score > best_score:
@@ -544,27 +519,35 @@ def _fuzzy_match_archetypes(
     if fuzzy_matches:
         log.info("  Fuzzy-matched archetype names:")
         for src, dst, score in fuzzy_matches:
-            log.info(f"    '{src}' → '{dst}' (score={score:.2f})")
+            log.info(f"    '{src}' -> '{dst}' (score={score:.2f})")
 
     return mapping
 
 
-def _build_counters_edges(
+def _build_winrate_edges(
     matchups: pd.DataFrame,
     arch_name_to_idx: dict,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build directed archetype -> archetype 'counters' edges.
+) -> tuple[dict[str, tuple[torch.Tensor, torch.Tensor]]]:
+    """Build two directed archetype -> archetype win rate edge types.
 
-    Only creates edge when win_rate > COUNTERS_WIN_RATE_THRESHOLD.
-    Uses fuzzy matching to handle naming differences between data sources.
+    Returns dict with two entries:
+      - "win_rate": A→B edges carrying A's win rate against B (my win rate vs opponent)
+      - "lose_rate": A→B edges carrying A's loss rate against B (opponent's win rate vs me)
+
+    These are separate edge types so the GNN learns distinct message transformations
+    for "I beat this archetype" vs "I lose to this archetype".
+
+    All pairwise rates stored as continuous 0-1 (no threshold filter).
     """
-    # Build fuzzy name mapping
     matchup_names = set(matchups["archetype_a"].unique()) | set(matchups["archetype_b"].unique())
     name_to_idx = _fuzzy_match_archetypes(matchup_names, arch_name_to_idx)
     log.info(f"  Matched {len(name_to_idx)}/{len(matchup_names)} matchup archetypes "
              f"to {len(arch_name_to_idx)} graph archetypes")
 
-    src_list, dst_list, weight_list = [], [], []
+    # win_rate: edge from source to target, weight = source's win rate against target
+    # lose_rate: edge from source to target, weight = target's win rate against source
+    wr_src, wr_dst, wr_weight = [], [], []
+    lr_src, lr_dst, lr_weight = [], [], []
 
     for _, row in matchups.iterrows():
         arch_a = row["archetype_a"]
@@ -572,23 +555,31 @@ def _build_counters_edges(
         if arch_a not in name_to_idx or arch_b not in name_to_idx:
             continue
 
-        # A counters B
-        if row["win_rate_a"] > COUNTERS_WIN_RATE_THRESHOLD:
-            src_list.append(name_to_idx[arch_a])
-            dst_list.append(name_to_idx[arch_b])
-            weight_list.append(row["win_rate_a"] / 100.0)
+        a_idx = name_to_idx[arch_a]
+        b_idx = name_to_idx[arch_b]
+        wr_a = row["win_rate_a"] / 100.0
+        wr_b = row["win_rate_b"] / 100.0
 
-        # B counters A
-        if row["win_rate_b"] > COUNTERS_WIN_RATE_THRESHOLD:
-            src_list.append(name_to_idx[arch_b])
-            dst_list.append(name_to_idx[arch_a])
-            weight_list.append(row["win_rate_b"] / 100.0)
+        # A's perspective: A→B with A's win rate, A→B with B's win rate (A's loss)
+        wr_src.append(a_idx); wr_dst.append(b_idx); wr_weight.append(wr_a)
+        lr_src.append(a_idx); lr_dst.append(b_idx); lr_weight.append(wr_b)
 
-    edge_index = torch.tensor([src_list, dst_list], dtype=torch.long)
-    edge_weight = torch.tensor(weight_list, dtype=torch.float32)
-    log.info(f"  counters: {edge_index.shape[1]} edges (archetype -> archetype)")
-    return edge_index, edge_weight
+        # B's perspective: B→A with B's win rate, B→A with A's win rate (B's loss)
+        wr_src.append(b_idx); wr_dst.append(a_idx); wr_weight.append(wr_b)
+        lr_src.append(b_idx); lr_dst.append(a_idx); lr_weight.append(wr_a)
 
+    edges = {}
+    wr_index = torch.tensor([wr_src, wr_dst], dtype=torch.long)
+    wr_w = torch.tensor(wr_weight, dtype=torch.float32)
+    edges["win_rate"] = (wr_index, wr_w)
+    log.info(f"  win_rate: {wr_index.shape[1]} edges (archetype -> archetype, source's win rate)")
+
+    lr_index = torch.tensor([lr_src, lr_dst], dtype=torch.long)
+    lr_w = torch.tensor(lr_weight, dtype=torch.float32)
+    edges["lose_rate"] = (lr_index, lr_w)
+    log.info(f"  lose_rate: {lr_index.shape[1]} edges (archetype -> archetype, source's loss rate)")
+
+    return edges
 
 
 def build_graph() -> HeteroData:
@@ -599,20 +590,21 @@ def build_graph() -> HeteroData:
     metagame = pd.read_parquet(METAGAME_PARQUET)
     decklists = pd.read_parquet(DECKLISTS_PARQUET)
     cards_df = pd.read_parquet(CARDS_PARQUET)
+    matchups = pd.read_parquet(MATCHUPS_PARQUET)
 
-    # Load card embeddings for archetype mean-embedding features
+    # Load card embeddings for set avg embedding features
     card_embeddings = np.load(CARD_EMBEDDINGS_PATH)
     with open(CARD_EMBEDDING_INDEX_PATH) as f:
         card_emb_index = json.load(f)
     card_emb_name_to_idx = {name: i for i, name in enumerate(card_emb_index)}
 
     arch_names, arch_name_to_idx, arch_features = _load_archetypes(
-        metagame, decklists, cards_df, card_embeddings, card_emb_name_to_idx
+        metagame, decklists, cards_df
     )
 
-    set_codes, set_names, set_code_to_idx, set_features = _load_sets(cards)
-
-    matchups = pd.read_parquet(MATCHUPS_PARQUET)
+    set_codes, set_names, set_code_to_idx, set_features = _load_sets(
+        cards, card_embeddings, card_emb_name_to_idx
+    )
 
     # ── Build HeteroData ──
     data = HeteroData()
@@ -630,56 +622,55 @@ def build_graph() -> HeteroData:
              f"archetype={data['archetype'].x.shape[0]}, "
              f"set={data['set'].x.shape[0]}")
 
-    # ── Card-to-card synergy edges (keyword, mechanical, semantic) ──
+    # ── Card-to-card synergy edges (keyword, semantic) ──
     log.info("\nBuilding card synergy edges...")
     synergy_edges = _build_card_synergy_edges(card_name_to_idx)
-
     for edge_type, (edge_index, edge_weight) in synergy_edges.items():
         data["card", edge_type, "card"].edge_index = edge_index
         data["card", edge_type, "card"].edge_weight = edge_weight
 
-    # ── Set -> Card edges (printed_in / from_set) ──
+    # ── Card-to-card interaction edges (counters, removes) ──
+    log.info("\nBuilding card interaction edges...")
+    interaction_edges = _build_card_interaction_edges(card_name_to_idx)
+    for edge_type, (edge_index, edge_weight) in interaction_edges.items():
+        data["card", edge_type, "card"].edge_index = edge_index
+        data["card", edge_type, "card"].edge_weight = edge_weight
+
+    # ── Set <-> Card edges (printed_in + member_of reverse) ──
     log.info("\nBuilding set-card edges...")
     printed_in_idx, printed_in_w = _build_set_card_edges(cards, card_name_to_idx, set_code_to_idx)
     data["set", "printed_in", "card"].edge_index = printed_in_idx
     data["set", "printed_in", "card"].edge_weight = printed_in_w
 
-    # Reverse: card -> set (from_set)
-    data["card", "from_set", "set"].edge_index = torch.stack([
+    # Reverse: card → set (cards send messages to their set nodes)
+    data["card", "member_of", "set"].edge_index = torch.stack([
         printed_in_idx[1], printed_in_idx[0]
     ])
-    data["card", "from_set", "set"].edge_weight = printed_in_w
+    data["card", "member_of", "set"].edge_weight = printed_in_w
+    log.info(f"  member_of: {printed_in_idx.shape[1]} edges (card -> set)")
 
-    # ── Deck edges (archetype -> card, split by mainboard/sideboard) ──
+    # ── Deck edges (archetype <-> card, unified contains/in_deck) ──
     log.info("\nBuilding deck edges...")
-    deck_edges = _build_deck_edges(decklists, card_name_to_idx, arch_name_to_idx)
+    contains_idx, contains_w = _build_deck_edges(decklists, card_name_to_idx, arch_name_to_idx)
+    data["archetype", "contains", "card"].edge_index = contains_idx
+    data["archetype", "contains", "card"].edge_weight = contains_w
 
-    for edge_name, (edge_index, edge_attr) in deck_edges.items():
-        # Forward: archetype -> card
-        data["archetype", edge_name, "card"].edge_index = edge_index
-        data["archetype", edge_name, "card"].edge_attr = edge_attr
-
-        # Reverse: card -> archetype
-        reverse_name = "maindeck_of" if edge_name == "maindecks" else "sideboard_of"
-        data["card", reverse_name, "archetype"].edge_index = torch.stack([
-            edge_index[1], edge_index[0]
-        ])
-        data["card", reverse_name, "archetype"].edge_attr = edge_attr
-
-    # ── Counters edges (archetype -> archetype) ──
-    counters_idx, counters_w = _build_counters_edges(matchups, arch_name_to_idx)
-    data["archetype", "counters", "archetype"].edge_index = counters_idx
-    data["archetype", "counters", "archetype"].edge_weight = counters_w
-
-    # ── Countered_by edges (reverse of counters) ──
-    data["archetype", "countered_by", "archetype"].edge_index = torch.stack([
-        counters_idx[1], counters_idx[0]
+    # Reverse: card -> archetype (in_deck)
+    data["card", "in_deck", "archetype"].edge_index = torch.stack([
+        contains_idx[1], contains_idx[0]
     ])
-    data["archetype", "countered_by", "archetype"].edge_weight = counters_w
+    data["card", "in_deck", "archetype"].edge_weight = contains_w
+
+    # ── Win rate edges (archetype -> archetype, two distinct types) ──
+    log.info("\nBuilding win rate edges...")
+    winrate_edges = _build_winrate_edges(matchups, arch_name_to_idx)
+    for edge_type, (edge_index, edge_weight) in winrate_edges.items():
+        data["archetype", edge_type, "archetype"].edge_index = edge_index
+        data["archetype", edge_type, "archetype"].edge_weight = edge_weight
 
     # ── Summary ──
     log.info(f"\n{'='*60}")
-    log.info(f"Graph summary:")
+    log.info("Graph summary:")
     log.info(f"  Node types: {data.node_types}")
     log.info(f"  Edge types: {data.edge_types}")
     total_edges = sum(
@@ -694,7 +685,7 @@ def build_graph() -> HeteroData:
 def main():
     data = build_graph()
 
-    # Sanitize all node features — ensure no NaN/Inf before saving
+    # Sanitize all node features
     for node_type in data.node_types:
         x = data[node_type].x
         nan_count = torch.isnan(x).sum().item()

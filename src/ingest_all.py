@@ -22,12 +22,13 @@ import pandas as pd
 from src.config import (
     CARDS_PARQUET,
     CARD_EMBEDDINGS_PATH,
+    COUNTER_EDGES_PATH,
     DECKLISTS_PARQUET,
     GRAPH_PATH,
     KEYWORD_MATRIX_PATH,
     MATCHUPS_PARQUET,
-    MECHANICAL_EDGES_PATH,
     METAGAME_PARQUET,
+    REMOVAL_EDGES_PATH,
     SEMANTIC_EDGES_PATH,
 )
 
@@ -231,32 +232,33 @@ def run_phase1():
             log.info(f"    {src_name}: {len(archs)} archetypes")
 
 
+def _validate_interaction_edges(path, name):
+    """Validate a counter/removal edge parquet."""
+    df = _validate_parquet(path, name)
+    if df is not None and not df.empty:
+        if "source_card" in df.columns:
+            unique_sources = df["source_card"].nunique()
+            unique_targets = df["target_card"].nunique()
+            log.info(f"    {unique_sources} source cards -> {unique_targets} target cards")
+    return df
+
+
 def run_phase2():
-    """Phase 2: Build synergy edges."""
+    """Phase 2: Build synergy and interaction edges."""
     log.info("")
     log.info("=" * 70)
-    log.info("PHASE 2: Synergy Edge Construction")
+    log.info("PHASE 2: Edge Construction (Synergy + Interaction)")
     log.info("=" * 70)
 
     # Step 1: Keyword matrix
-    log.info("\n── Step 1/3: Keyword Synergy Edges ──")
+    log.info("\n── Step 1/4: Keyword Synergy Edges ──")
     from src.keyword_matrix import run as build_keywords
 
     build_keywords()
     _validate_synergy_edges(KEYWORD_MATRIX_PATH, "keyword_synergy")
 
-    # Step 2: Oracle text parsing (mechanical edges)
-    log.info("\n── Step 2/3: Mechanical Synergy Edges ──")
-    try:
-        from src.oracle_parser import run as build_mechanical
-
-        build_mechanical()
-    except ImportError:
-        log.info("  oracle_parser not available, skipping")
-    _validate_synergy_edges(MECHANICAL_EDGES_PATH, "mechanical_synergy")
-
-    # Step 3: Semantic embeddings
-    log.info("\n── Step 3/3: Semantic Synergy Edges ──")
+    # Step 2: Semantic embeddings
+    log.info("\n── Step 2/4: Semantic Synergy Edges ──")
     from src.card_embeddings import run as build_embeddings
 
     build_embeddings()
@@ -267,6 +269,15 @@ def run_phase2():
 
         emb = np.load(CARD_EMBEDDINGS_PATH)
         log.info(f"    Embedding matrix: {emb.shape[0]} cards x {emb.shape[1]}-dim")
+
+    # Step 3: Counter/removal interaction edges
+    log.info("\n── Step 3/4: Counter Edges ──")
+    log.info("\n── Step 4/4: Removal Edges ──")
+    from src.card_interaction_edges import run as build_interactions
+
+    build_interactions()
+    _validate_interaction_edges(COUNTER_EDGES_PATH, "counter_edges")
+    _validate_interaction_edges(REMOVAL_EDGES_PATH, "removal_edges")
 
 
 def run_phase3():
@@ -305,8 +316,9 @@ def print_summary():
         ("Decklists", DECKLISTS_PARQUET),
         ("Matchups", MATCHUPS_PARQUET),
         ("Keyword Synergy", KEYWORD_MATRIX_PATH),
-        ("Mechanical Synergy", MECHANICAL_EDGES_PATH),
         ("Semantic Synergy", SEMANTIC_EDGES_PATH),
+        ("Counter Edges", COUNTER_EDGES_PATH),
+        ("Removal Edges", REMOVAL_EDGES_PATH),
         ("Graph", GRAPH_PATH),
     ]
 
@@ -364,8 +376,9 @@ def main():
         _validate_matchups(matchups)
         log.info("\n── Phase 2 Outputs ──")
         _validate_synergy_edges(KEYWORD_MATRIX_PATH, "keyword_synergy")
-        _validate_synergy_edges(MECHANICAL_EDGES_PATH, "mechanical_synergy")
         _validate_synergy_edges(SEMANTIC_EDGES_PATH, "semantic_synergy")
+        _validate_interaction_edges(COUNTER_EDGES_PATH, "counter_edges")
+        _validate_interaction_edges(REMOVAL_EDGES_PATH, "removal_edges")
         log.info("\n── Phase 3 Outputs ──")
         _validate_graph()
         print_summary()

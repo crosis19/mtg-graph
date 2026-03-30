@@ -123,7 +123,10 @@ def build_keyword_edges(cards_df: pd.DataFrame) -> pd.DataFrame:
     Only considers cards that have at least one keyword.
     """
     # Parse keywords from pipe-separated string
-    cards_with_kw = cards_df[cards_df["keyword_count"] > 0].copy()
+    has_keywords = cards_df["keywords"].apply(
+        lambda x: bool(x) and pd.notna(x) and len(x.strip()) > 0
+    )
+    cards_with_kw = cards_df[has_keywords].copy()
     cards_with_kw["keyword_list"] = cards_with_kw["keywords"].str.split("|")
 
     log.info("Cards with keywords: %d / %d", len(cards_with_kw), len(cards_df))

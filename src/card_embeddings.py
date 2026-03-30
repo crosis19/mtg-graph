@@ -24,7 +24,6 @@ from src.config import (
     CARD_EMBEDDING_INDEX_PATH,
     SEMANTIC_EDGES_PATH,
     KEYWORD_MATRIX_PATH,
-    MECHANICAL_EDGES_PATH,
     DATA_EMBEDDINGS,
     DATA_PROCESSED,
     EMBEDDING_MODEL,
@@ -87,10 +86,10 @@ def compute_embeddings(cards_df: pd.DataFrame) -> tuple[np.ndarray, list[str]]:
 
 
 def load_existing_edges() -> set[tuple[str, str]]:
-    """Load card pairs that already have keyword or mechanical synergy edges."""
+    """Load card pairs that already have keyword synergy edges."""
     existing_pairs = set()
 
-    for path in [KEYWORD_MATRIX_PATH, MECHANICAL_EDGES_PATH]:
+    for path in [KEYWORD_MATRIX_PATH]:
         if path.exists():
             df = pd.read_parquet(path)
             for _, row in df.iterrows():

@@ -2,19 +2,19 @@
 
 Collects:
   - Archetype-level metagame data (share %, deck count, color identity)
-  - Per-card decklists for archetypes above the meta share threshold
+  - Per-card decklists for the top N archetypes by meta share
 
 Uses https://www.mtggoldfish.com/metagame/standard#paper which defaults to
 30-day paper metagame data. Each archetype tile links to an archetype page
 with a "Card Breakdown" section showing average copies and inclusion rate
-per card, split by mainboard/sideboard.
+per card.
 
 Fallback: If Card Breakdown parsing fails, downloads the text decklist
 from the /deck/download/ endpoint.
 
 Outputs:
   - metagame.parquet  (archetype-level stats)
-  - decklists.parquet (per-card data for eligible archetypes)
+  - decklists.parquet (per-card data for top N archetypes)
 """
 
 import logging
@@ -28,8 +28,8 @@ from bs4 import BeautifulSoup
 
 from src.config import (
     DATA_PROCESSED,
+    DECK_NUM_ARCHETYPES,
     DECKLISTS_PARQUET,
-    DECK_MIN_META_SHARE,
     METAGAME_PARQUET,
     SCRAPE_DELAY,
 )
@@ -344,20 +344,21 @@ def run() -> pd.DataFrame:
     meta_df.to_parquet(METAGAME_PARQUET, index=False)
     log.info("Saved %d metagame rows to %s", len(meta_df), METAGAME_PARQUET)
 
-    # Step 2: Filter to eligible archetypes (≥ min meta share)
+    # Step 2: Select top N archetypes by meta share (no minimum threshold)
     latest = (
         meta_df.sort_values("snapshot_date")
         .groupby("archetype")
         .last()
         .reset_index()
     )
-    eligible = latest[latest["meta_share_pct"] >= DECK_MIN_META_SHARE]
-    log.info("\n%d archetypes with >= %.1f%% meta share:", len(eligible), DECK_MIN_META_SHARE)
+    latest = latest.dropna(subset=["meta_share_pct"])
+    eligible = latest.nlargest(DECK_NUM_ARCHETYPES, "meta_share_pct")
+    log.info("\nTop %d archetypes by meta share:", len(eligible))
     for _, row in eligible.sort_values("meta_share_pct", ascending=False).iterrows():
         log.info("  %5.1f%%  %s", row["meta_share_pct"], row["archetype"])
 
     if eligible.empty:
-        log.warning("No archetypes meet the meta share threshold!")
+        log.warning("No archetypes found!")
         empty_dl = pd.DataFrame(columns=[
             "archetype", "card_name", "avg_copies", "inclusion_pct",
             "board", "snapshot_date",
