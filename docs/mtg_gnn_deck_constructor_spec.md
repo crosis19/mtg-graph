@@ -101,11 +101,12 @@ Use MLP-based message passing with a configurable message dimension (`d_message`
 For each GNN layer `l` (default: 2 layers):
 
 ```
-message_j^(l) = AGG({ MLP_edge_type^(l)(c_k^(l)) : k in N_type(j) })
+message_j^(l) = AGG({ w_{k->j} * MLP_edge_type^(l)(c_k^(l)) : k in N_type(j) })
 c_j^(l+1) = c_j^(0) + MLP_update^(l)(message_j^(l))
 ```
 
 Where:
+- `w_{k->j}` is the **edge weight** from the graph (e.g., copy count, synergy strength, win rate). Messages are scaled by their edge weight before aggregation. Edges without stored weights default to 1.0.
 - `c_j^(0)` is the **original** embedding of node `j` (not the previous layer output -- this is the skip connection)
 - `AGG` is mean aggregation over neighbors
 - `MLP_edge_type^(l)` is a separate 2-layer MLP per edge type (since this is a heterogeneous graph)
@@ -133,8 +134,10 @@ Setting `d_message = d_model` recovers the standard same-dimension message passi
 Since different edge types carry different semantic meaning, use **separate message MLPs per edge type**. If a node receives messages from multiple edge types, aggregate each type independently (mean per type) and then sum:
 
 ```
-message_j^(l) = SUM_{type} MEAN({ MLP_type^(l)(c_k^(l)) : k in N_type(j) })
+message_j^(l) = SUM_{type} MEAN({ w_{k->j} * MLP_type^(l)(c_k^(l)) : k in N_type(j) })
 ```
+
+Edge weights are computed during graph construction and stored per edge type. Messages are scaled by these weights before mean aggregation, so higher-weight edges (e.g., 4-copy cards, strong synergies, high win rates) send proportionally stronger signals. Edge types without stored weights (or edges with weight 1.0 such as `printed_in`/`member_of`) pass through unscaled.
 
 ### 3.4 Output
 

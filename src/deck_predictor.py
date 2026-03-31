@@ -4,16 +4,20 @@ Two-stage architecture for predicting competitive 60-card MTG decklists:
 
   Stage 1 (HeteroGNN):
     MLP-based message passing over the heterogeneous metagame graph.
-    Learns card and archetype embeddings via separate MLPs per edge type
-    with additive skip connections back to layer-0 embeddings.
+    Learns card, archetype, and set embeddings via separate MLPs per
+    edge type with additive skip connections back to layer-0 embeddings.
+    Messages are scaled by edge weights from the graph before aggregation.
 
   Stage 2 (DeckConstructor):
     Given an archetype embedding, autoregressively selects cards and
     predicts copy counts via cross-attention over the card pool.
     Builds a deck one card at a time until the 60-card budget is spent.
 
-Training uses Gumbel-softmax straight-through estimation so the model
-trains on its own predictions (no teacher forcing).
+Training uses Gumbel-softmax straight-through estimation for card and
+count selection. Context correction provides partial teacher forcing on
+the deck context: when the model selects a wrong card, a random
+ground-truth card is substituted into the context to prevent error
+snowballing. The loss still penalizes the model's actual wrong pick.
 """
 
 import math
@@ -108,8 +112,9 @@ class HeteroGNNLayer(nn.Module):
     """One round of heterogeneous message passing.
 
     For each edge type, source embeddings are transformed by a dedicated
-    MessageMLP, mean-aggregated at the destination, then all edge-type
-    contributions are summed per node type and passed through an UpdateMLP.
+    MessageMLP, scaled by edge weights (if present), mean-aggregated at
+    the destination, then all edge-type contributions are summed per node
+    type and passed through an UpdateMLP.
     """
 
     def __init__(
@@ -140,6 +145,7 @@ class HeteroGNNLayer(nn.Module):
         self,
         x_dict: dict[str, torch.Tensor],
         edge_index_dict: dict[tuple, torch.Tensor],
+        edge_weight_dict: dict[tuple, torch.Tensor | None],
     ) -> dict[str, torch.Tensor]:
         """Compute per-node-type update vectors (before skip connection).
 
@@ -164,6 +170,11 @@ class HeteroGNNLayer(nn.Module):
             # Transform source embeddings with edge-type-specific MLP
             src_emb = x_dict[src_type][src_idx]           # (n_edges, d_model)
             messages = self.message_mlps[key](src_emb)     # (n_edges, d_message)
+
+            # Scale messages by edge weight (if available)
+            weights = edge_weight_dict.get(et)
+            if weights is not None:
+                messages = messages * weights.unsqueeze(1)  # (n_edges, 1) broadcast
 
             # Mean aggregation at destination nodes
             n_dst = x_dict[dst_type].shape[0]
@@ -224,15 +235,17 @@ class HeteroGNN(nn.Module):
             if nt in self.encoders:
                 x_dict_0[nt] = self.encoders[nt](data[nt].x)
 
-        # Collect edge indices
+        # Collect edge indices and weights
         edge_index_dict = {}
+        edge_weight_dict = {}
         for et in data.edge_types:
             edge_index_dict[et] = data[et].edge_index
+            edge_weight_dict[et] = getattr(data[et], "edge_weight", None)
 
         # Message passing with additive skip to layer 0
         x_dict = {nt: x_dict_0[nt].clone() for nt in x_dict_0}
         for layer in self.layers:
-            updates = layer(x_dict, edge_index_dict)
+            updates = layer(x_dict, edge_index_dict, edge_weight_dict)
             for nt in x_dict:
                 if nt in updates:
                     x_dict[nt] = x_dict_0[nt] + updates[nt]
@@ -433,15 +446,18 @@ def gumbel_softmax_sample(logits: torch.Tensor, tau: float, hard: bool = True) -
 
 
 class DeckConstructor(nn.Module):
-    """Autoregressive deck builder.
+    """Autoregressive deck builder with context correction.
 
     Given an archetype embedding and the full card pool, iteratively:
       1. Self-attend over the current deck context
       2. Cross-attend to score all eligible cards
       3. Select one card (Gumbel-softmax in training, argmax in inference)
       4. Predict copy count for the selected card
-      5. Append the count-conditioned card to the context
-      6. Repeat until the 60-card budget is exhausted
+      5. Context correction (training only): if the selected card is not
+         in the target deck, substitute a random remaining ground-truth
+         card into the context to prevent error snowballing
+      6. Append the count-conditioned card to the context
+      7. Repeat until the 60-card budget is exhausted
     """
 
     def __init__(
@@ -545,18 +561,9 @@ class DeckConstructor(nn.Module):
             count = count_idx + 1  # positions are 0-indexed, counts are 1-indexed
             count = min(count, budget)  # safety clamp
 
-            # 6. Record step info for loss computation (always the model's actual pick)
-            steps.append({
-                "card_idx": card_idx,
-                "count": count,
-                "select_logits": select_logits,
-                "select_probs": select_probs,
-                "count_logits": count_logits,
-                "count_probs": count_probs,
-            })
-
-            # 7. Context correction: if the model picked wrong during training,
+            # 6. Context correction: if the model picked wrong during training,
             #    substitute a random remaining target card into the context
+            sub_idx = None
             use_model_pick = True
             if target_deck is not None and not greedy and card_idx not in target_deck:
                 # Find eligible target cards (in GT and not yet selected)
@@ -581,6 +588,19 @@ class DeckConstructor(nn.Module):
                     sub_count_emb = self.count_embedding(sub_count_idx)
                     merged = self.context_merge(sub_card_emb, sub_count_emb)
                     context = torch.cat([context, merged.unsqueeze(0)], dim=0)
+
+            # 7. Record step info for loss computation (always the model's actual pick).
+            #    Include substituted_card_idx so the loss function can remove the
+            #    substituted card from its own target tracking.
+            steps.append({
+                "card_idx": card_idx,
+                "count": count,
+                "select_logits": select_logits,
+                "select_probs": select_probs,
+                "count_logits": count_logits,
+                "count_probs": count_probs,
+                "substituted_card_idx": sub_idx,
+            })
 
             if use_model_pick:
                 # Correct pick (or greedy / no target) — use model's selection
@@ -681,13 +701,60 @@ class MTGDeckModel(nn.Module):
             arch_emb, card_emb, self.basic_land_mask, tau, greedy, target_deck,
         )
 
+    def forward_with_embeddings(
+        self,
+        x_dict: dict[str, torch.Tensor],
+        archetype_idx: int,
+        tau: float = 1.0,
+        greedy: bool = False,
+        target_deck: dict[int, int] | None = None,
+    ) -> dict:
+        """Run deck construction using pre-computed GNN embeddings.
+
+        Use this when the GNN output has been cached (e.g., to avoid
+        redundant GNN passes across multiple archetypes in the same epoch).
+        Gradients still flow through x_dict back to the GNN.
+
+        Args:
+            x_dict: pre-computed {node_type: embeddings} from self.gnn(data).
+            archetype_idx: which archetype to build a deck for.
+            tau: Gumbel temperature for training.
+            greedy: if True, use argmax (inference mode).
+            target_deck: {card_idx: count} ground truth for context correction.
+
+        Returns:
+            dict with 'deck' ({card_idx: count}) and 'steps' (per-step info).
+        """
+        arch_emb = x_dict["archetype"][archetype_idx]
+        card_emb = x_dict["card"]
+
+        return self.decoder(
+            arch_emb, card_emb, self.basic_land_mask, tau, greedy, target_deck,
+        )
+
     @torch.no_grad()
-    def predict_deck(self, data: HeteroData, archetype_idx: int) -> dict[int, int]:
+    def predict_deck(
+        self,
+        data: HeteroData,
+        archetype_idx: int,
+        x_dict: dict[str, torch.Tensor] | None = None,
+    ) -> dict[int, int]:
         """Convenience method for greedy inference.
+
+        Args:
+            data: the HeteroData graph (used if x_dict is None).
+            archetype_idx: which archetype to build a deck for.
+            x_dict: optional pre-computed GNN embeddings. If provided,
+                skips the GNN forward pass.
 
         Returns:
             {card_idx: count} — a valid 60-card decklist.
         """
         self.eval()
-        result = self.forward(data, archetype_idx, greedy=True)
+        if x_dict is not None:
+            result = self.forward_with_embeddings(
+                x_dict, archetype_idx, greedy=True,
+            )
+        else:
+            result = self.forward(data, archetype_idx, greedy=True)
         return result["deck"]

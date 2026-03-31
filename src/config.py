@@ -85,22 +85,29 @@ DECK_LR_SCHEDULER = os.getenv("DECK_LR_SCHEDULER", "cosine")  # cosine | linear 
 DECK_NUM_ARCHETYPES = int(os.getenv("DECK_NUM_ARCHETYPES", "16"))
 DECK_NUM_VAL_ARCHETYPES = int(os.getenv("DECK_NUM_VAL_ARCHETYPES", "3"))
 DECK_NUM_CV_FOLDS = int(os.getenv("DECK_NUM_CV_FOLDS", "5"))
+DECK_BATCH_SIZE = int(os.getenv("DECK_BATCH_SIZE", "0"))  # archetypes per step (0 = all)
+DECK_VAL_EVERY = int(os.getenv("DECK_VAL_EVERY", "5"))    # epochs between validation
 
 # Legacy: still used by graph_builder for copy-count edge weight encoding
 DECK_BASIC_LAND_MAX_COPIES = int(os.getenv("DECK_BASIC_LAND_MAX_COPIES", "20"))
 
 # Results — each run gets a timestamped subfolder
-def create_run_dir(task: str | None = None) -> Path:
+def create_run_dir(task: str | None = None, results_base: Path | None = None) -> Path:
     """Create and return a timestamped results directory for this training run.
 
     Parameters
     ----------
     task : str or None
         Optional task name for results separation (e.g. "metagame", "deck").
-        When provided, results go to results/<task>/<timestamp>/ with a
-        results/<task>/latest symlink. When None, uses flat results/<timestamp>/.
+        When provided, results go to <base>/<task>/<timestamp>/ with a
+        <base>/<task>/latest symlink. When None, uses flat <base>/<timestamp>/.
+    results_base : Path or None
+        Override the default results directory (RESULTS_DIR). Useful for
+        writing intermediate outputs to fast local storage (e.g., Colab's
+        /content/) instead of Google Drive during sweeps.
     """
-    base = RESULTS_DIR / task if task else RESULTS_DIR
+    root = results_base if results_base is not None else RESULTS_DIR
+    base = root / task if task else root
     run_name = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
     run_dir = base / run_name
     run_dir.mkdir(parents=True, exist_ok=True)

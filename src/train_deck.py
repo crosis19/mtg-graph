@@ -2,13 +2,16 @@
 
 Trains a GNN + cross-attention model to predict 60-card MTG decklists
 from archetype identity. The model builds decks autoregressively using
-its own predictions (no teacher forcing).
+Gumbel-softmax selection with context correction (partial teacher
+forcing on the deck context when the model picks wrong cards).
 
 Key design:
   1. Gumbel-softmax straight-through for differentiable card/count selection
-  2. Per-step loss: card selection CE + count prediction CE
-  3. Temperature annealing: tau decays from 1.0 toward 0.1 over training
-  4. Archetype-holdout cross-validation for robust evaluation
+  2. Context correction: wrong picks are substituted with random GT cards
+     in the context to prevent error snowballing (loss still penalizes)
+  3. Per-step loss: card selection CE + count prediction CE
+  4. Temperature annealing: tau decays from 1.0 toward 0.1 over training
+  5. Archetype-holdout cross-validation for robust evaluation
 """
 
 import json
@@ -28,6 +31,7 @@ from src.config import (
     D_COUNT,
     D_MESSAGE,
     D_MODEL,
+    DECK_BATCH_SIZE,
     DECK_LEARNING_RATE,
     DECK_LR_SCHEDULER,
     DECK_NUM_CV_FOLDS,
@@ -35,6 +39,7 @@ from src.config import (
     DECK_NUM_VAL_ARCHETYPES,
     DECK_PATIENCE,
     DECK_RECENCY_DAYS,
+    DECK_VAL_EVERY,
     DECK_WARMUP_EPOCHS,
     DECKLISTS_PARQUET,
     DROPOUT,
@@ -223,6 +228,13 @@ def compute_step_losses(
                 n_select += 1
             # No count loss for wrong card selections
 
+            # If context correction substituted a GT card into the context,
+            # remove it from our tracking so we don't penalize future steps
+            # for failing to pick a card that is already selected/ineligible.
+            sub_idx = step.get("substituted_card_idx")
+            if sub_idx is not None and sub_idx in target_remaining:
+                del target_remaining[sub_idx]
+
     # Average losses
     avg_select = total_select_loss / max(n_select, 1)
     avg_count = total_count_loss / max(n_count, 1)
@@ -263,6 +275,9 @@ def evaluate_fold(
     """
     model.eval()
 
+    # Cache GNN embeddings once for all validation archetypes
+    x_dict = model.gnn(data)
+
     precision_list, recall_list = [], []
     exact_match_list, mae_list = [], []
     jaccard_list = []
@@ -274,7 +289,7 @@ def evaluate_fold(
         if not gt:
             continue
 
-        pred = model.predict_deck(data, a_idx)
+        pred = model.predict_deck(data, a_idx, x_dict=x_dict)
         n_evaluated += 1
         gt_set = set(gt.keys())
         pred_set = set(pred.keys())
@@ -388,9 +403,12 @@ def train_deck(device=None, trial=None, **overrides):
         "gumbel_tau_start": overrides.get("gumbel_tau_start", GUMBEL_TAU_START),
         "gumbel_tau_min": overrides.get("gumbel_tau_min", GUMBEL_TAU_MIN),
         "gumbel_decay": overrides.get("gumbel_decay", GUMBEL_DECAY),
+        "batch_size": overrides.get("batch_size", DECK_BATCH_SIZE),
+        "val_every": overrides.get("val_every", DECK_VAL_EVERY),
     }
 
-    run_dir = create_run_dir(task="deck")
+    results_base = overrides.get("results_base", None)
+    run_dir = create_run_dir(task="deck", results_base=results_base)
     log.info(f"Results will be saved to {run_dir}")
     log.info(f"Hyperparameters: {hp}")
 
@@ -496,6 +514,10 @@ def train_deck(device=None, trial=None, **overrides):
         val_metrics_history = []
         model_path = run_dir / f"model_fold{fold_i}.pt"
 
+        # Effective batch size: 0 means all archetypes in one step
+        eff_batch = hp["batch_size"] if hp["batch_size"] > 0 else len(train_archs)
+        val_every = hp["val_every"]
+
         log.info(f"\n{'Epoch':>5} {'Loss':>8} {'SelL':>8} {'CntL':>8} "
                  f"{'Tau':>6} {'Prec':>8} {'Rec':>8} {'Jacc':>8} "
                  f"{'ExCnt':>8} {'MAE':>8} {'LR':>10}")
@@ -513,21 +535,40 @@ def train_deck(device=None, trial=None, **overrides):
             epoch_correct = 0
             epoch_steps = 0
 
-            # Accumulate gradients across all training archetypes, then step
+            # Shuffle archetypes for stochastic batching (only those with GT)
+            epoch_archs = [a for a in train_archs if ground_truth.get(a)]
+            random.shuffle(epoch_archs)
+            n_archs = len(epoch_archs)
+
+            # Process archetypes in batches
             optimizer.zero_grad()
+            batch_count = 0
 
-            for a_idx in train_archs:
-                gt = ground_truth.get(a_idx, {})
-                if not gt:
-                    continue
+            # Cache GNN embeddings (recomputed after each optimizer step).
+            # Multiple backward() calls through the same cached x_dict require
+            # retain_graph=True on all but the last call in each batch.
+            x_dict = model.gnn(data)
 
-                result = model(data, a_idx, tau=tau, greedy=False, target_deck=gt)
+            for arch_i, a_idx in enumerate(epoch_archs):
+                gt = ground_truth[a_idx]
+
+                result = model.forward_with_embeddings(
+                    x_dict, a_idx, tau=tau, greedy=False, target_deck=gt,
+                )
                 loss, metrics = compute_step_losses(
                     result["steps"], gt, hp["count_loss_weight"],
                 )
 
-                # Scale loss by number of archetypes for consistent gradient magnitude
-                (loss / len(train_archs)).backward()
+                # Determine if this is the last backward through the current
+                # GNN graph: either the batch is about to be full, or we've
+                # reached the last archetype in the epoch.
+                batch_count += 1
+                is_last_in_batch = (batch_count >= eff_batch) or (arch_i == n_archs - 1)
+
+                # Scale loss by effective batch size for consistent gradient magnitude.
+                # retain_graph=True keeps the GNN computation graph alive for
+                # subsequent archetypes sharing the same cached x_dict.
+                (loss / eff_batch).backward(retain_graph=not is_last_in_batch)
 
                 epoch_loss += metrics["total_loss"]
                 epoch_select_loss += metrics["select_loss"]
@@ -535,8 +576,22 @@ def train_deck(device=None, trial=None, **overrides):
                 epoch_correct += metrics["correct_cards"]
                 epoch_steps += metrics["total_steps"]
 
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+                # Step when batch is full
+                if batch_count >= eff_batch:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    batch_count = 0
+                    # Recompute GNN embeddings since weights changed
+                    if arch_i < n_archs - 1:
+                        x_dict = model.gnn(data)
+
+            # Handle final partial batch
+            if batch_count > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                optimizer.zero_grad()
+
             scheduler.step()
 
             n_train = max(len(train_archs), 1)
@@ -551,9 +606,9 @@ def train_deck(device=None, trial=None, **overrides):
 
             # ── Logging ──
             lr = scheduler.get_last_lr()[0]
+            do_val = (epoch % val_every == 0 or epoch == 1)
 
-            # ── Validation ──
-            if epoch % 5 == 0 or epoch == 1:
+            if do_val:
                 val_metrics = evaluate_fold(model, data, ground_truth, val_archs)
                 val_metrics_history.append({"epoch": epoch, **val_metrics})
 
@@ -580,6 +635,8 @@ def train_deck(device=None, trial=None, **overrides):
                     f"{lr:10.6f}"
                 )
 
+            # ── Model saving + early stopping (only on validation epochs) ──
+            if do_val:
                 current_metric = val_metrics["jaccard"]
 
                 if current_metric > best_val_metric:
@@ -598,7 +655,7 @@ def train_deck(device=None, trial=None, **overrides):
 
                 # Optuna pruning
                 if trial is not None:
-                    trial.report(current_metric, len(val_metrics_history))
+                    trial.report(current_metric, epoch)
                     if trial.should_prune():
                         log.info(f"\nOptuna pruned at epoch {epoch}")
                         try:
@@ -706,6 +763,11 @@ def evaluate_deck(result: dict):
 
         checkpoint = torch.load(model_path, weights_only=False)
         model.load_state_dict(checkpoint["model_state_dict"])
+        model.eval()
+
+        # Cache GNN embeddings once for all archetypes in this fold
+        with torch.no_grad():
+            x_dict = model.gnn(data)
 
         arch_to_idx = {a: i for i, a in enumerate(arch_names)}
 
@@ -715,7 +777,7 @@ def evaluate_deck(result: dict):
             if not gt:
                 continue
 
-            pred = model.predict_deck(data, a_idx)
+            pred = model.predict_deck(data, a_idx, x_dict=x_dict)
             gt_set = set(gt.keys())
             pred_set = set(pred.keys())
             common = gt_set & pred_set
