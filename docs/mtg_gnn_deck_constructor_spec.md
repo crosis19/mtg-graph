@@ -11,7 +11,7 @@ This architecture predicts competitive 60-card Magic: The Gathering mainboard de
 1. **GNN Message Passing** — Learn card, archetype, and set embeddings from a heterogeneous metagame graph.
 2. **Autoregressive Cross-Attention Deck Construction** — An archetype embedding iteratively selects cards and predicts copy counts via cross-attention over the card pool, building a deck one card-selection at a time until the 60-card budget is exhausted.
 
-The model trains end-to-end using its own predictions (no teacher forcing), with **context correction** that substitutes ground-truth cards into the deck context when the model makes wrong selections during training. Gradient flow through discrete sampling decisions is handled via Gumbel-softmax relaxation.
+The model trains end-to-end using argmax card selection with two forms of teacher forcing: **context correction** substitutes ground-truth cards into the deck context when the model makes wrong selections, and **count teacher forcing** uses ground-truth copy counts for deck state on correct picks to prevent budget drift.
 
 ---
 
@@ -221,9 +221,7 @@ Card selection distribution:
 p(select j at step t) = softmax(scores)_j
 ```
 
-At inference: select `s_t = argmax_j p(j)`.
-
-During training (see Section 5): use Gumbel-softmax to produce a differentiable soft selection.
+Both training and inference use `s_t = argmax_j p(j)`. During training, context correction and count teacher forcing (see Section 5) keep the autoregressive state grounded.
 
 ### 4.4 Count Prediction
 
@@ -260,13 +258,11 @@ For non-basic cards, mask positions 5-20 to `-inf`.
 For basic lands, mask any count exceeding `remaining_budget`.
 Always mask position 0 (count of zero is invalid -- card was selected).
 
-At inference: `n_t = argmax_k p(n = k)`.
-
-During training: use Gumbel-softmax over valid count logits.
+Both training and inference use `n_t = argmax_k p(n = k)`. During training, when the model selects a correct card, the ground-truth count is teacher-forced into the deck state and context update (preventing budget drift), while the model's predicted count is still used for loss computation.
 
 ### 4.5 Context Update
 
-After selecting card `s_t` with count `n_t`:
+After selecting card `s_t` with count `n_t` (or ground-truth count during training for correct picks):
 
 1. Create a count-conditioned card representation:
    ```
@@ -299,57 +295,16 @@ p(select j) = softmax(combined)_j
 
 ## 5. Training Procedure
 
-### 5.1 Self-Prediction with Context Correction
+### 5.1 Argmax Selection with Context Correction and Count Teacher Forcing
 
-The model uses its own predictions during training with **context correction**: when the model selects a wrong card (not in the ground-truth deck), a random remaining target card is substituted into the deck context for the next step. This prevents error snowballing through the autoregressive loop while still penalizing the wrong selection via the loss.
+The model uses argmax for both card selection and count prediction during training, with two forms of teacher forcing to keep the autoregressive state grounded:
 
-- **Correct pick:** The model's selected card and count are used for both the loss and the context update. The Gumbel-softmax differentiable path is preserved for gradient flow through the context.
-- **Wrong pick:** The loss penalizes the wrong selection. For the context update, a random remaining ground-truth card is substituted with its ground-truth count. The substitute card's embedding is a raw lookup (no Gumbel gradient through context for wrong picks). If no remaining ground-truth cards are available, the model's pick is used as fallback.
+- **Correct pick:** The model's selected card is used for the loss. The **ground-truth count** is teacher-forced into the deck state and context update (preventing budget drift), while the model's predicted count is used for loss computation.
+- **Wrong pick:** The loss penalizes the wrong selection. For the context update, a random remaining ground-truth card is substituted with its ground-truth count. If no remaining ground-truth cards are available, the model's pick is used as fallback.
 
-At inference, no context correction is applied -- the model runs purely on its own greedy selections.
+At inference, no teacher forcing is applied -- the model runs purely on its own greedy selections.
 
-### 5.2 Gumbel-Softmax for Differentiable Sampling
-
-Since argmax is non-differentiable, use the **straight-through Gumbel-softmax estimator**:
-
-**Forward pass:** Use hard argmax (pick one card / one count).
-
-**Backward pass:** Use the continuous Gumbel-softmax relaxation for gradient computation.
-
-For card selection at step t:
-
-```
-# Forward (hard):
-s_t = argmax_j(scores_j)
-one_hot_hard = one_hot(s_t, |eligible|)
-
-# Backward (soft relaxation):
-g_j ~ Gumbel(0, 1)                                    # sample Gumbel noise
-soft_j = softmax((scores_j + g_j) / tau)              # temperature-scaled softmax
-
-# Straight-through:
-selection = one_hot_hard - soft.detach() + soft        # hard forward, soft backward
-```
-
-The soft card embedding used for context update during backprop:
-
-```
-c_soft_t = SUM_j selection_j * c_j      # weighted blend during backward pass
-```
-
-Same procedure for count prediction -- apply Gumbel-softmax over valid count logits.
-
-### 5.3 Temperature Schedule
-
-```
-tau(epoch) = max(0.1, 1.0 * exp(-0.01 * epoch))
-```
-
-- Early training (tau ~ 1.0): Soft selections, broad gradient signal, exploratory.
-- Late training (tau -> 0.1): Near-hard selections, fine-tuning precise card choices.
-- Never anneal to exactly 0 (gradients vanish).
-
-### 5.4 Loss Function
+### 5.2 Loss Function
 
 At each step `t`, the model incurs loss for both card selection and count prediction:
 
@@ -373,7 +328,7 @@ L = (SUM_t L_select_t) / n_steps + lambda * (SUM_t L_count_t) / n_count_steps
 
 Default `lambda = 1.0`. If count accuracy lags behind selection accuracy during training, increase `lambda`.
 
-### 5.5 Ground Truth Deck Representation
+### 5.3 Ground Truth Deck Representation
 
 Each training example is an (archetype_index, deck) pair where `deck` is a dictionary:
 
@@ -386,7 +341,7 @@ Each training example is an (archetype_index, deck) pair where `deck` is a dicti
 
 The set of card indices present in `deck` is the target card set. The model's selections are compared against this set (order-independent). Non-basic card counts are clamped to [1, 4], basic land counts to [1, 20].
 
-### 5.6 Training Enhancements
+### 5.4 Training Enhancements
 
 | Feature | Description |
 |---------|-------------|
@@ -437,9 +392,6 @@ For higher-quality predictions, maintain `B` candidate partial decks at each ste
 | `num_attn_heads` | 4 | For both self-attention and cross-attention |
 | `d_k` | 32 | = d_model / num_attn_heads |
 | `dropout` | 0.1 | Applied in MLPs and attention |
-| `gumbel_tau_start` | 1.0 | Initial Gumbel temperature |
-| `gumbel_tau_min` | 0.1 | Minimum Gumbel temperature |
-| `gumbel_decay` | 0.01 | Exponential decay rate |
 | `learning_rate` | 1e-4 | AdamW optimizer |
 | `weight_decay` | 1e-5 | Decoupled L2 regularization |
 | `count_loss_weight` | 1.0 | Lambda for count loss term |
@@ -531,18 +483,19 @@ The following PyTorch `nn.Module` classes comprise the implementation:
 ### 8.11 `DeckConstructor`
 - Top-level module that orchestrates the full autoregressive loop
 - Holds: `DeckContextEncoder`, `CardSelector`, `CountPredictor`, `CountEmbedding`, `ContextMerge`
-- Implements the step-by-step deck construction loop with context correction
-- Accepts optional `target_deck` for context correction during training
-- Handles Gumbel-softmax during training, argmax during inference
+- Implements the step-by-step deck construction loop with context correction and count teacher forcing
+- Accepts optional `target_deck` for teacher forcing during training
+- Uses argmax for both card selection and count prediction
+- During training: context correction substitutes GT cards on wrong picks; count teacher forcing uses GT counts on correct picks
 - Tracks budget, selected set, target remaining set, and context matrix
-- Input: archetype embedding `a_i`, all card embeddings `C`, basic land mask, tau, greedy flag, optional target_deck
+- Input: archetype embedding `a_i`, all card embeddings `C`, basic land mask, greedy flag, optional target_deck
 - Output: dict with `deck` ({card_index: count}) and `steps` (per-step logits/probs for loss)
 
 ### 8.12 `MTGDeckModel`
 - Top-level wrapper that combines everything
 - Holds: `HeteroGNN` (with `NodeEncoder` per type), `DeckConstructor`
 - Precomputes and registers basic land mask from card names
-- Input: HeteroData graph, archetype index, tau, greedy flag, optional target_deck
+- Input: HeteroData graph, archetype index, greedy flag, optional target_deck
 - Output: dict with `deck` and `steps`
 - Convenience method `predict_deck()` for greedy inference
 
@@ -605,7 +558,7 @@ Used to set the basic land mask per card, which controls count masking in `Count
 
 4. **Context correction during training:** Pure self-prediction causes error snowballing -- one wrong card pollutes the context, causing subsequent picks to go further off-track. Substituting a random ground-truth card into the context keeps the autoregressive state grounded while the loss still penalizes the wrong selection. This is a form of partial teacher forcing that applies only to the context, not to the loss or selection mechanism.
 
-5. **Gumbel-softmax training (no teacher forcing on selections):** Eliminates exposure bias and the card ordering problem simultaneously. The model trains on its own selection logits exactly as it runs at inference.
+5. **Argmax selection with context correction and count teacher forcing:** The model uses the same argmax selection at training and inference, eliminating train/test mismatch. Context correction prevents error snowballing from wrong card picks. Count teacher forcing prevents budget drift from wrong copy counts, keeping the autoregressive state grounded. This approach eliminates 3 Gumbel-softmax hyperparameters (tau_start, tau_min, decay) while providing more direct supervision.
 
 6. **Classification over regression for counts:** Card count distributions are non-smooth (a card is often 0 or 4, rarely 2). Classification with masking respects both the discrete nature and the domain constraints.
 

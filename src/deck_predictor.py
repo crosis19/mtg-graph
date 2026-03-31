@@ -13,11 +13,14 @@ Two-stage architecture for predicting competitive 60-card MTG decklists:
     predicts copy counts via cross-attention over the card pool.
     Builds a deck one card at a time until the 60-card budget is spent.
 
-Training uses Gumbel-softmax straight-through estimation for card and
-count selection. Context correction provides partial teacher forcing on
-the deck context: when the model selects a wrong card, a random
-ground-truth card is substituted into the context to prevent error
-snowballing. The loss still penalizes the model's actual wrong pick.
+Training uses argmax card selection with two forms of teacher forcing:
+  1. Context correction: when the model selects a wrong card, a random
+     ground-truth card is substituted into the context to prevent error
+     snowballing. The loss still penalizes the model's actual wrong pick.
+  2. Count teacher forcing: when the model selects a correct card, the
+     ground-truth count is used for the deck state and context update
+     (preventing budget drift), while the loss trains on the model's
+     predicted count.
 """
 
 import math
@@ -428,34 +431,20 @@ class ContextMerge(nn.Module):
         return self.net(torch.cat([card_emb, count_emb]))
 
 
-def gumbel_softmax_sample(logits: torch.Tensor, tau: float, hard: bool = True) -> torch.Tensor:
-    """Gumbel-softmax with straight-through estimation.
-
-    During training (hard=True): forward pass uses argmax (hard one-hot),
-    backward pass uses the continuous relaxation for gradient flow.
-
-    Args:
-        logits: raw scores (may contain -inf for masked positions).
-        tau: temperature — higher = more uniform, lower = more peaked.
-        hard: if True, use straight-through (hard forward, soft backward).
-
-    Returns:
-        one_hot: (len(logits),) — one-hot vector (hard) or soft probabilities.
-    """
-    return F.gumbel_softmax(logits, tau=tau, hard=hard, dim=-1)
-
-
 class DeckConstructor(nn.Module):
-    """Autoregressive deck builder with context correction.
+    """Autoregressive deck builder with context correction and count
+    teacher forcing.
 
     Given an archetype embedding and the full card pool, iteratively:
       1. Self-attend over the current deck context
       2. Cross-attend to score all eligible cards
-      3. Select one card (Gumbel-softmax in training, argmax in inference)
+      3. Select one card via argmax
       4. Predict copy count for the selected card
-      5. Context correction (training only): if the selected card is not
-         in the target deck, substitute a random remaining ground-truth
-         card into the context to prevent error snowballing
+      5. Context correction (training only):
+         - Wrong card: substitute a random remaining ground-truth card
+           with its GT count into the context
+         - Correct card: use GT count for deck state and context update
+           (count teacher forcing prevents budget drift)
       6. Append the count-conditioned card to the context
       7. Repeat until the 60-card budget is exhausted
     """
@@ -481,7 +470,6 @@ class DeckConstructor(nn.Module):
         arch_embedding: torch.Tensor,
         card_embeddings: torch.Tensor,
         basic_land_mask: torch.Tensor,
-        tau: float = 1.0,
         greedy: bool = False,
         target_deck: dict[int, int] | None = None,
     ) -> dict:
@@ -491,13 +479,11 @@ class DeckConstructor(nn.Module):
             arch_embedding: (d_model,) — archetype embedding from GNN.
             card_embeddings: (n_cards, d_model) — all card embeddings from GNN.
             basic_land_mask: (n_cards,) bool — True for basic land cards.
-            tau: Gumbel-softmax temperature (ignored if greedy=True).
-            greedy: if True, use argmax instead of Gumbel-softmax.
-            target_deck: {card_idx: count} ground truth for context correction
-                during training. When the model picks a wrong card, a random
-                remaining target card is substituted into the context so that
-                subsequent steps condition on a valid deck state. The loss
-                still penalizes the wrong pick. None disables correction.
+            greedy: if True, use argmax without teacher forcing (inference).
+            target_deck: {card_idx: count} ground truth for teacher forcing
+                during training. Context correction substitutes GT cards on
+                wrong picks; count teacher forcing uses GT counts on correct
+                picks to prevent budget drift. None disables both.
 
         Returns:
             dict with:
@@ -533,30 +519,16 @@ class DeckConstructor(nn.Module):
             # 3. Score all cards via cross-attention
             select_logits = self.card_selector(q_t, card_embeddings, eligible)
 
-            # 4. Select a card
-            if greedy:
-                card_idx = select_logits.argmax().item()
-                card_emb = card_embeddings[card_idx]
-                select_probs = F.softmax(select_logits, dim=-1)
-            else:
-                # Gumbel-softmax: hard forward, soft backward
-                select_one_hot = gumbel_softmax_sample(select_logits, tau, hard=True)
-                card_idx = select_one_hot.argmax().item()
-                # Differentiable card embedding (soft blend in backward pass)
-                card_emb = select_one_hot @ card_embeddings
-                select_probs = F.softmax(select_logits, dim=-1)
+            # 4. Select a card (always argmax)
+            card_idx = select_logits.argmax().item()
+            card_emb = card_embeddings[card_idx]
+            select_probs = F.softmax(select_logits, dim=-1)
 
             # 5. Predict copy count
             is_basic = basic_land_mask[card_idx].item()
             count_logits = self.count_predictor(q_t, card_emb, is_basic, budget)
-
-            if greedy:
-                count_idx = count_logits.argmax().item()
-                count_probs = F.softmax(count_logits, dim=-1)
-            else:
-                count_one_hot = gumbel_softmax_sample(count_logits, tau, hard=True)
-                count_idx = count_one_hot.argmax().item()
-                count_probs = F.softmax(count_logits, dim=-1)
+            count_idx = count_logits.argmax().item()
+            count_probs = F.softmax(count_logits, dim=-1)
 
             count = count_idx + 1  # positions are 0-indexed, counts are 1-indexed
             count = min(count, budget)  # safety clamp
@@ -582,7 +554,7 @@ class DeckConstructor(nn.Module):
                     selected[sub_idx] = True
                     budget -= sub_count
 
-                    # Build context from substituted card (no Gumbel gradient)
+                    # Build context from substituted card
                     sub_card_emb = card_embeddings[sub_idx]
                     sub_count_idx = sub_count - 1
                     sub_count_emb = self.count_embedding(sub_count_idx)
@@ -607,16 +579,21 @@ class DeckConstructor(nn.Module):
                 if card_idx in target_remaining:
                     target_remaining.discard(card_idx)
 
-                deck[card_idx] = count
-                selected[card_idx] = True
-                budget -= count
-
-                # Update context with count-conditioned card representation
-                if greedy:
-                    count_emb = self.count_embedding(count_idx)
+                # Count teacher forcing: during training, use GT count for
+                # deck state and context to prevent budget drift. The model's
+                # predicted count is still in the step dict for loss.
+                if target_deck is not None and not greedy and card_idx in target_deck:
+                    gt_count = target_deck[card_idx]
+                    gt_count = min(gt_count, budget)
+                    deck[card_idx] = gt_count
+                    selected[card_idx] = True
+                    budget -= gt_count
+                    count_emb = self.count_embedding(gt_count - 1)
                 else:
-                    # Differentiable count embedding (soft blend in backward pass)
-                    count_emb = count_one_hot @ self.count_embedding.embedding.weight
+                    deck[card_idx] = count
+                    selected[card_idx] = True
+                    budget -= count
+                    count_emb = self.count_embedding(count_idx)
 
                 merged = self.context_merge(card_emb, count_emb)
                 context = torch.cat([context, merged.unsqueeze(0)], dim=0)
@@ -676,7 +653,6 @@ class MTGDeckModel(nn.Module):
         self,
         data: HeteroData,
         archetype_idx: int,
-        tau: float = 1.0,
         greedy: bool = False,
         target_deck: dict[int, int] | None = None,
     ) -> dict:
@@ -685,9 +661,8 @@ class MTGDeckModel(nn.Module):
         Args:
             data: the HeteroData metagame graph.
             archetype_idx: which archetype to build a deck for.
-            tau: Gumbel temperature for training.
-            greedy: if True, use argmax (inference mode).
-            target_deck: {card_idx: count} ground truth for context correction
+            greedy: if True, use argmax without teacher forcing (inference).
+            target_deck: {card_idx: count} ground truth for teacher forcing
                 during training (see DeckConstructor.forward).
 
         Returns:
@@ -698,14 +673,13 @@ class MTGDeckModel(nn.Module):
         card_emb = x_dict["card"]
 
         return self.decoder(
-            arch_emb, card_emb, self.basic_land_mask, tau, greedy, target_deck,
+            arch_emb, card_emb, self.basic_land_mask, greedy, target_deck,
         )
 
     def forward_with_embeddings(
         self,
         x_dict: dict[str, torch.Tensor],
         archetype_idx: int,
-        tau: float = 1.0,
         greedy: bool = False,
         target_deck: dict[int, int] | None = None,
     ) -> dict:
@@ -718,9 +692,8 @@ class MTGDeckModel(nn.Module):
         Args:
             x_dict: pre-computed {node_type: embeddings} from self.gnn(data).
             archetype_idx: which archetype to build a deck for.
-            tau: Gumbel temperature for training.
-            greedy: if True, use argmax (inference mode).
-            target_deck: {card_idx: count} ground truth for context correction.
+            greedy: if True, use argmax without teacher forcing (inference).
+            target_deck: {card_idx: count} ground truth for teacher forcing.
 
         Returns:
             dict with 'deck' ({card_idx: count}) and 'steps' (per-step info).
@@ -729,7 +702,7 @@ class MTGDeckModel(nn.Module):
         card_emb = x_dict["card"]
 
         return self.decoder(
-            arch_emb, card_emb, self.basic_land_mask, tau, greedy, target_deck,
+            arch_emb, card_emb, self.basic_land_mask, greedy, target_deck,
         )
 
     @torch.no_grad()

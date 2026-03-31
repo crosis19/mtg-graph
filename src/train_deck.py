@@ -2,21 +2,18 @@
 
 Trains a GNN + cross-attention model to predict 60-card MTG decklists
 from archetype identity. The model builds decks autoregressively using
-Gumbel-softmax selection with context correction (partial teacher
-forcing on the deck context when the model picks wrong cards).
+argmax selection with teacher forcing for context correction and counts.
 
 Key design:
-  1. Gumbel-softmax straight-through for differentiable card/count selection
-  2. Context correction: wrong picks are substituted with random GT cards
-     in the context to prevent error snowballing (loss still penalizes)
+  1. Argmax card selection with context correction on wrong picks
+  2. Count teacher forcing: GT counts used for deck state on correct picks
   3. Per-step loss: card selection CE + count prediction CE
-  4. Temperature annealing: tau decays from 1.0 toward 0.1 over training
-  5. Archetype-holdout cross-validation for robust evaluation
+  4. Archetype-holdout cross-validation for robust evaluation
 """
 
+import gc
 import json
 import logging
-import math
 import random
 from datetime import datetime, timedelta, timezone
 
@@ -24,6 +21,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
+import torch_geometric  # noqa: F401 — must be fully loaded before torch.load unpickles HeteroData
 
 from src.config import (
     CARDS_PARQUET,
@@ -44,9 +42,6 @@ from src.config import (
     DECKLISTS_PARQUET,
     DROPOUT,
     GRAPH_PATH,
-    GUMBEL_DECAY,
-    GUMBEL_TAU_MIN,
-    GUMBEL_TAU_START,
     MAX_BASIC_LAND_COUNT,
     MAX_NONBASIC_COUNT,
     NUM_ATTN_HEADS,
@@ -90,13 +85,19 @@ def _build_ground_truth(
 ) -> dict[int, dict[int, int]]:
     """Build per-archetype ground truth with raw integer copy counts.
 
-    Returns {arch_idx: {card_idx: count}} where counts sum to ~60.
-    Non-basic cards are clamped to [1, 4], basic lands to [1, 20].
+    Uses only the latest snapshot per archetype so counts reflect the
+    current meta. Returns {arch_idx: {card_idx: count}} where counts
+    sum to 60. Non-basic cards are clamped to [1, 4], basic lands to
+    [1, 20].
     """
     arch_names = data["archetype"].names
     card_names = data["card"].names
     arch_to_idx = {a: i for i, a in enumerate(arch_names)}
     card_to_idx = {c: i for i, c in enumerate(card_names)}
+    # Front-face aliases for multi-face cards (MTGGoldfish → Scryfall)
+    for name, idx in list(card_to_idx.items()):
+        if " // " in name:
+            card_to_idx.setdefault(name.split(" // ")[0], idx)
 
     copies_col = "avg_copies" if "avg_copies" in decklists.columns else "copies"
 
@@ -104,10 +105,16 @@ def _build_ground_truth(
     if "board" in decklists.columns:
         decklists = decklists[decklists["board"] == "main"]
 
-    # Aggregate copies per (archetype, card)
+    # Use only the latest snapshot per archetype so counts reflect the
+    # current meta rather than accumulating historical maximums.
+    if "snapshot_date" in decklists.columns:
+        latest = decklists.groupby("archetype")["snapshot_date"].transform("max")
+        decklists = decklists[decklists["snapshot_date"] == latest]
+
+    # One row per (archetype, card) — no cross-snapshot aggregation needed
     agg = (
         decklists.groupby(["archetype", "card_name"])[copies_col]
-        .max()
+        .first()
         .reset_index()
     )
 
@@ -116,7 +123,15 @@ def _build_ground_truth(
     for _, row in agg.iterrows():
         arch = row["archetype"]
         card = row["card_name"]
-        if arch not in arch_to_idx or card not in card_to_idx:
+        if arch not in arch_to_idx:
+            continue
+        # Normalize split card separator: "A/B" → "A // B"
+        if card not in card_to_idx and "/" in card and " // " not in card:
+            card = card.replace("/", " // ")
+        if card not in card_to_idx:
+            copies = round(float(row[copies_col]))
+            log.warning("  Dropped %s (%d copies) from %s — card not in graph",
+                         card, copies, arch)
             continue
 
         a_idx = arch_to_idx[arch]
@@ -142,15 +157,6 @@ def _build_ground_truth(
 # ════════════════════════════════════════════════════════════════════
 #  Temperature Schedule
 # ════════════════════════════════════════════════════════════════════
-
-
-def gumbel_temperature(epoch: int, start: float, min_val: float, decay: float) -> float:
-    """Exponential decay schedule for Gumbel-softmax temperature.
-
-    Early training (tau ~ 1.0): soft selections, broad gradient signal.
-    Late training (tau -> 0.1): near-hard selections, precise card choices.
-    """
-    return max(min_val, start * math.exp(-decay * epoch))
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -274,9 +280,11 @@ def evaluate_fold(
       - rules_compliance: fraction of decks with all counts within limits
     """
     model.eval()
+    use_amp = next(model.parameters()).device.type == "cuda"
 
     # Cache GNN embeddings once for all validation archetypes
-    x_dict = model.gnn(data)
+    with torch.amp.autocast("cuda", enabled=use_amp):
+        x_dict = model.gnn(data)
 
     precision_list, recall_list = [], []
     exact_match_list, mae_list = [], []
@@ -289,7 +297,8 @@ def evaluate_fold(
         if not gt:
             continue
 
-        pred = model.predict_deck(data, a_idx, x_dict=x_dict)
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            pred = model.predict_deck(data, a_idx, x_dict=x_dict)
         n_evaluated += 1
         gt_set = set(gt.keys())
         pred_set = set(pred.keys())
@@ -400,9 +409,6 @@ def train_deck(device=None, trial=None, **overrides):
         "count_loss_weight": overrides.get("count_loss_weight", COUNT_LOSS_WEIGHT),
         "n_val_archetypes": overrides.get("n_val_archetypes", DECK_NUM_VAL_ARCHETYPES),
         "n_cv_folds": overrides.get("n_cv_folds", DECK_NUM_CV_FOLDS),
-        "gumbel_tau_start": overrides.get("gumbel_tau_start", GUMBEL_TAU_START),
-        "gumbel_tau_min": overrides.get("gumbel_tau_min", GUMBEL_TAU_MIN),
-        "gumbel_decay": overrides.get("gumbel_decay", GUMBEL_DECAY),
         "batch_size": overrides.get("batch_size", DECK_BATCH_SIZE),
         "val_every": overrides.get("val_every", DECK_VAL_EVERY),
     }
@@ -506,6 +512,18 @@ def train_deck(device=None, trial=None, **overrides):
         else:
             scheduler = base_sched
 
+        # ── Mixed precision & torch.compile ──
+        use_amp = device.type == "cuda"
+        scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+
+        if device.type == "cuda" and hasattr(torch, "compile"):
+            try:
+                model.gnn = torch.compile(model.gnn, mode="reduce-overhead")
+                if fold_i == 0:
+                    log.info("  torch.compile() applied to GNN")
+            except Exception as e:
+                log.warning(f"  torch.compile() failed, continuing without: {e}")
+
         # ── Training loop ──
         best_val_metric = -1.0
         best_epoch = 0
@@ -519,15 +537,12 @@ def train_deck(device=None, trial=None, **overrides):
         val_every = hp["val_every"]
 
         log.info(f"\n{'Epoch':>5} {'Loss':>8} {'SelL':>8} {'CntL':>8} "
-                 f"{'Tau':>6} {'Prec':>8} {'Rec':>8} {'Jacc':>8} "
+                 f"{'Prec':>8} {'Rec':>8} {'Jacc':>8} "
                  f"{'ExCnt':>8} {'MAE':>8} {'LR':>10}")
-        log.info("-" * 110)
+        log.info("-" * 104)
 
         for epoch in range(1, hp["num_epochs"] + 1):
             model.train()
-            tau = gumbel_temperature(
-                epoch, hp["gumbel_tau_start"], hp["gumbel_tau_min"], hp["gumbel_decay"],
-            )
 
             epoch_loss = 0.0
             epoch_select_loss = 0.0
@@ -547,17 +562,19 @@ def train_deck(device=None, trial=None, **overrides):
             # Cache GNN embeddings (recomputed after each optimizer step).
             # Multiple backward() calls through the same cached x_dict require
             # retain_graph=True on all but the last call in each batch.
-            x_dict = model.gnn(data)
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                x_dict = model.gnn(data)
 
             for arch_i, a_idx in enumerate(epoch_archs):
                 gt = ground_truth[a_idx]
 
-                result = model.forward_with_embeddings(
-                    x_dict, a_idx, tau=tau, greedy=False, target_deck=gt,
-                )
-                loss, metrics = compute_step_losses(
-                    result["steps"], gt, hp["count_loss_weight"],
-                )
+                with torch.amp.autocast("cuda", enabled=use_amp):
+                    result = model.forward_with_embeddings(
+                        x_dict, a_idx, greedy=False, target_deck=gt,
+                    )
+                    loss, metrics = compute_step_losses(
+                        result["steps"], gt, hp["count_loss_weight"],
+                    )
 
                 # Determine if this is the last backward through the current
                 # GNN graph: either the batch is about to be full, or we've
@@ -568,7 +585,7 @@ def train_deck(device=None, trial=None, **overrides):
                 # Scale loss by effective batch size for consistent gradient magnitude.
                 # retain_graph=True keeps the GNN computation graph alive for
                 # subsequent archetypes sharing the same cached x_dict.
-                (loss / eff_batch).backward(retain_graph=not is_last_in_batch)
+                scaler.scale(loss / eff_batch).backward(retain_graph=not is_last_in_batch)
 
                 epoch_loss += metrics["total_loss"]
                 epoch_select_loss += metrics["select_loss"]
@@ -578,18 +595,23 @@ def train_deck(device=None, trial=None, **overrides):
 
                 # Step when batch is full
                 if batch_count >= eff_batch:
+                    scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    optimizer.step()
+                    scaler.step(optimizer)
+                    scaler.update()
                     optimizer.zero_grad()
                     batch_count = 0
                     # Recompute GNN embeddings since weights changed
                     if arch_i < n_archs - 1:
-                        x_dict = model.gnn(data)
+                        with torch.amp.autocast("cuda", enabled=use_amp):
+                            x_dict = model.gnn(data)
 
             # Handle final partial batch
             if batch_count > 0:
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
                 optimizer.zero_grad()
 
             scheduler.step()
@@ -599,7 +621,6 @@ def train_deck(device=None, trial=None, **overrides):
                 "loss": epoch_loss / n_train,
                 "select_loss": epoch_select_loss / n_train,
                 "count_loss": epoch_count_loss / n_train,
-                "tau": tau,
                 "correct_cards": epoch_correct,
                 "total_steps": epoch_steps,
             })
@@ -616,7 +637,6 @@ def train_deck(device=None, trial=None, **overrides):
                     f"{epoch:5d} {epoch_loss / n_train:8.4f} "
                     f"{epoch_select_loss / n_train:8.4f} "
                     f"{epoch_count_loss / n_train:8.4f} "
-                    f"{tau:6.3f} "
                     f"{val_metrics['precision']:8.3f} "
                     f"{val_metrics['recall']:8.3f} "
                     f"{val_metrics['jaccard']:8.3f} "
@@ -629,7 +649,6 @@ def train_deck(device=None, trial=None, **overrides):
                     f"{epoch:5d} {epoch_loss / n_train:8.4f} "
                     f"{epoch_select_loss / n_train:8.4f} "
                     f"{epoch_count_loss / n_train:8.4f} "
-                    f"{tau:6.3f} "
                     f"{'---':>8} {'---':>8} {'---':>8} "
                     f"{'---':>8} {'---':>8} "
                     f"{lr:10.6f}"
@@ -646,7 +665,10 @@ def train_deck(device=None, trial=None, **overrides):
                     torch.save({
                         "epoch": epoch,
                         "fold": fold_i,
-                        "model_state_dict": model.state_dict(),
+                        "model_state_dict": {
+                            k.replace("_orig_mod.", ""): v
+                            for k, v in model.state_dict().items()
+                        },
                         "val_metrics": val_metrics,
                         "hyperparameters": hp,
                     }, model_path)
@@ -681,6 +703,13 @@ def train_deck(device=None, trial=None, **overrides):
             "val_metrics_history": val_metrics_history,
             "model_path": str(model_path),
         })
+
+        # Free GPU memory before next fold (keep last fold's model for return)
+        if fold_i < len(folds_to_run) - 1:
+            del model, optimizer, scheduler, scaler
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            gc.collect()
 
     # ── Summary across folds ──
     if len(all_fold_results) > 1:
@@ -766,7 +795,8 @@ def evaluate_deck(result: dict):
         model.eval()
 
         # Cache GNN embeddings once for all archetypes in this fold
-        with torch.no_grad():
+        eval_amp = data["card"].x.device.type == "cuda"
+        with torch.no_grad(), torch.amp.autocast("cuda", enabled=eval_amp):
             x_dict = model.gnn(data)
 
         arch_to_idx = {a: i for i, a in enumerate(arch_names)}
@@ -777,7 +807,8 @@ def evaluate_deck(result: dict):
             if not gt:
                 continue
 
-            pred = model.predict_deck(data, a_idx, x_dict=x_dict)
+            with torch.no_grad(), torch.amp.autocast("cuda", enabled=eval_amp):
+                pred = model.predict_deck(data, a_idx, x_dict=x_dict)
             gt_set = set(gt.keys())
             pred_set = set(pred.keys())
             common = gt_set & pred_set

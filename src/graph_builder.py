@@ -99,6 +99,12 @@ def _load_cards() -> tuple[pd.DataFrame, dict, torch.Tensor]:
     ).reset_index(drop=True)
 
     card_name_to_idx = {name: i for i, name in enumerate(cards["name"])}
+    # Add front-face aliases so MTGGoldfish names resolve to Scryfall names.
+    # E.g. "Bramble Familiar" → idx of "Bramble Familiar // Fetch Quest"
+    for name, idx in list(card_name_to_idx.items()):
+        if " // " in name:
+            front = name.split(" // ")[0]
+            card_name_to_idx.setdefault(front, idx)
 
     # Load pre-computed 384-dim embeddings
     embeddings = np.load(CARD_EMBEDDINGS_PATH)
@@ -448,6 +454,9 @@ def _build_deck_edges(
     for _, row in agg.iterrows():
         arch = row["archetype"]
         card = row["card_name"]
+        # Normalize split card separator: "A/B" → "A // B"
+        if card not in card_name_to_idx and "/" in card and " // " not in card:
+            card = card.replace("/", " // ")
         if arch not in arch_name_to_idx or card not in card_name_to_idx:
             continue
 

@@ -61,11 +61,6 @@ NUM_GNN_LAYERS = int(os.getenv("NUM_GNN_LAYERS", "2"))
 NUM_ATTN_HEADS = int(os.getenv("NUM_ATTN_HEADS", "4"))
 DROPOUT = float(os.getenv("DROPOUT", "0.1"))
 
-# Gumbel-softmax temperature schedule
-GUMBEL_TAU_START = float(os.getenv("GUMBEL_TAU_START", "1.0"))
-GUMBEL_TAU_MIN = float(os.getenv("GUMBEL_TAU_MIN", "0.1"))
-GUMBEL_DECAY = float(os.getenv("GUMBEL_DECAY", "0.01"))
-
 # Loss weights
 COUNT_LOSS_WEIGHT = float(os.getenv("COUNT_LOSS_WEIGHT", "1.0"))
 

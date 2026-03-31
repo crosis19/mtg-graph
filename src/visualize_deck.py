@@ -90,7 +90,6 @@ def generate_deck_html(training_log: dict, deck_predictions: dict) -> str:
         train_losses = first_fold.get("train_losses", [])
         select_losses = [t.get("select_loss", 0) for t in train_losses]
         count_losses = [t.get("count_loss", 0) for t in train_losses]
-        taus = [t.get("tau", 1.0) for t in train_losses]
         best_epoch = first_fold.get("best_epoch", 0)
 
         last_val = (first_fold.get("val_metrics_history", [{}])[-1]
@@ -149,7 +148,6 @@ def generate_deck_html(training_log: dict, deck_predictions: dict) -> str:
 
     select_losses_json = json.dumps(select_losses)
     count_losses_json = json.dumps(count_losses)
-    taus_json = json.dumps(taus)
     num_epochs = hp.get("num_epochs", 50)
 
     # CV fold summary
@@ -293,8 +291,6 @@ def generate_deck_html(training_log: dict, deck_predictions: dict) -> str:
           <dt>Dropout</dt><dd>{hp.get('dropout', '?')}</dd>
           <dt>LR</dt><dd>{hp.get('learning_rate', '?')}</dd>
           <dt>Weight Decay</dt><dd>{hp.get('weight_decay', '?')}</dd>
-          <dt>Gumbel &tau;</dt><dd>{hp.get('gumbel_tau_start', '?')} &rarr; {hp.get('gumbel_tau_min', '?')}</dd>
-          <dt>Gumbel Decay</dt><dd>{hp.get('gumbel_decay', '?')}</dd>
           <dt>Count Loss &lambda;</dt><dd>{hp.get('count_loss_weight', '?')}</dd>
           <dt>LR Schedule</dt><dd>{hp.get('warmup_epochs', 0)}ep warmup &rarr; {hp.get('lr_scheduler', '?')}</dd>
           <dt>Recency</dt><dd>{hp.get('recency_days', '?')}d</dd>
@@ -322,10 +318,9 @@ def generate_deck_html(training_log: dict, deck_predictions: dict) -> str:
   <script>
     const selectLosses = {select_losses_json};
     const countLosses = {count_losses_json};
-    const tauValues = {taus_json};
     const bestEpoch = {best_epoch};
 
-    const margin = {{top: 20, right: 60, bottom: 35, left: 50}};
+    const margin = {{top: 20, right: 40, bottom: 35, left: 50}};
     const width = 900 - margin.left - margin.right;
     const height = 250 - margin.top - margin.bottom;
 
@@ -338,7 +333,6 @@ def generate_deck_html(training_log: dict, deck_predictions: dict) -> str:
     const allLoss = selectLosses.concat(countLosses).filter(v => isFinite(v) && v > 0);
     const maxLoss = allLoss.length > 0 ? d3.max(allLoss) * 1.1 : 1;
     const yLoss = d3.scaleLinear().domain([0, maxLoss]).range([height, 0]);
-    const yTau = d3.scaleLinear().domain([0, 1.1]).range([height, 0]);
 
     // Axes
     svg.append('g').attr('transform', `translate(0,${{height}})`)
@@ -346,9 +340,6 @@ def generate_deck_html(training_log: dict, deck_predictions: dict) -> str:
       .selectAll('text,line,path').attr('stroke','#555').attr('fill','#888').attr('font-size',9);
     svg.append('g').call(d3.axisLeft(yLoss).ticks(5))
       .selectAll('text,line,path').attr('stroke','#555').attr('fill','#888').attr('font-size',9);
-    svg.append('g').attr('transform', `translate(${{width}},0)`)
-      .call(d3.axisRight(yTau).ticks(5))
-      .selectAll('text,line,path').attr('stroke','#555').attr('fill','#E8A838').attr('font-size',9);
 
     // Select loss line
     const selLine = d3.line().defined(d => isFinite(d)).x((d,i) => xScale(i+1)).y(d => yLoss(d));
@@ -359,12 +350,6 @@ def generate_deck_html(training_log: dict, deck_predictions: dict) -> str:
     const cntLine = d3.line().defined(d => isFinite(d)).x((d,i) => xScale(i+1)).y(d => yLoss(d));
     svg.append('path').datum(countLosses)
       .attr('fill','none').attr('stroke','#1D9E75').attr('stroke-width',1.5).attr('d', cntLine);
-
-    // Temperature line (right axis)
-    const tauLine = d3.line().defined(d => isFinite(d)).x((d,i) => xScale(i+1)).y(d => yTau(d));
-    svg.append('path').datum(tauValues)
-      .attr('fill','none').attr('stroke','#E8A838').attr('stroke-width',1)
-      .attr('stroke-dasharray','4,3').attr('d', tauLine);
 
     // Best epoch marker
     if (bestEpoch > 0) {{
@@ -382,8 +367,8 @@ def generate_deck_html(training_log: dict, deck_predictions: dict) -> str:
       .attr('text-anchor','middle').attr('fill','#888').attr('font-size',11).text('Loss');
 
     // Legend
-    const legend = svg.append('g').attr('transform', `translate(${{width-180}},5)`);
-    [['Select Loss','#7F77DD'],['Count Loss','#1D9E75'],['Gumbel \\u03C4','#E8A838'],['Best','#E24B4A']].forEach(([label,color],i) => {{
+    const legend = svg.append('g').attr('transform', `translate(${{width-140}},5)`);
+    [['Select Loss','#7F77DD'],['Count Loss','#1D9E75'],['Best','#E24B4A']].forEach(([label,color],i) => {{
       legend.append('rect').attr('x',0).attr('y',i*16).attr('width',12).attr('height',3).attr('fill',color);
       legend.append('text').attr('x',16).attr('y',i*16+4).attr('fill','#888').attr('font-size',10).text(label);
     }});

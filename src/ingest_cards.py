@@ -84,6 +84,24 @@ def _card_to_record(card: dict) -> dict | None:
             val = json.dumps(val)
         record[field] = val
 
+    # For multi-face cards (transform, adventure, modal DFC), Scryfall puts
+    # oracle_text and type_line on card_faces, not the top level.  Merge both
+    # faces so downstream embeddings and interaction edges see the full card.
+    faces = card.get("card_faces")
+    if faces and len(faces) >= 2:
+        if not record.get("oracle_text"):
+            record["oracle_text"] = " // ".join(
+                f.get("oracle_text", "") for f in faces
+            )
+        if not record.get("type_line"):
+            record["type_line"] = " // ".join(
+                f.get("type_line", "") for f in faces
+            )
+        if not record.get("mana_cost"):
+            record["mana_cost"] = " // ".join(
+                f.get("mana_cost", "") for f in faces
+            )
+
     return record
 
 
