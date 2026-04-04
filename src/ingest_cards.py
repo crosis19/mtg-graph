@@ -1,7 +1,8 @@
-"""Phase 1: Download and normalize Scryfall oracle card data for Standard-legal cards.
+"""Phase 1: Download and normalize Scryfall oracle card data.
 
-Downloads the oracle_cards bulk JSON from Scryfall, filters to Standard-legal cards,
-and produces a cleaned parquet with the fields needed for graph construction.
+Downloads the oracle_cards bulk JSON from Scryfall, filters to cards legal in any
+active format (Standard, Pioneer, etc.), and produces a cleaned parquet with the
+fields needed for graph construction.
 """
 
 import json
@@ -12,7 +13,7 @@ from pathlib import Path
 
 from src.config import (
     SCRYFALL_BULK_URL, ORACLE_CARDS_PATH, CARDS_PARQUET,
-    DATA_RAW, DATA_PROCESSED,
+    DATA_RAW, DATA_PROCESSED, ACTIVE_FORMATS, SUPPORTED_FORMATS,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -62,11 +63,20 @@ def download_bulk_data(force: bool = False) -> Path:
     return ORACLE_CARDS_PATH
 
 
-def _card_to_record(card: dict) -> dict | None:
-    """Convert a Scryfall card object to a flat record dict, or None to skip."""
-    # Filter: must be legal in Standard
+def _card_to_record(card: dict, formats: list[str] | None = None) -> dict | None:
+    """Convert a Scryfall card object to a flat record dict, or None to skip.
+
+    Keeps a card if it is legal in ANY of the specified formats.
+    Adds per-format legality boolean columns (e.g. legal_standard, legal_pioneer).
+    """
+    if formats is None:
+        formats = ACTIVE_FORMATS
+
     legalities = card.get("legalities", {})
-    if legalities.get("standard") != "legal":
+    legality_keys = [SUPPORTED_FORMATS[f]["legality_key"] for f in formats]
+
+    # Keep card if legal in at least one active format
+    if not any(legalities.get(k) == "legal" for k in legality_keys):
         return None
 
     # Skip tokens, emblems, art series, etc.
@@ -83,6 +93,11 @@ def _card_to_record(card: dict) -> dict | None:
         elif isinstance(val, dict):
             val = json.dumps(val)
         record[field] = val
+
+    # Per-format legality flags
+    for fmt in formats:
+        key = SUPPORTED_FORMATS[fmt]["legality_key"]
+        record[f"legal_{fmt}"] = legalities.get(key) == "legal"
 
     # For multi-face cards (transform, adventure, modal DFC), Scryfall puts
     # oracle_text and type_line on card_faces, not the top level.  Merge both
@@ -105,8 +120,11 @@ def _card_to_record(card: dict) -> dict | None:
     return record
 
 
-def load_and_filter(path: Path) -> pd.DataFrame:
-    """Load oracle cards JSON and filter to Standard-legal cards."""
+def load_and_filter(path: Path, formats: list[str] | None = None) -> pd.DataFrame:
+    """Load oracle cards JSON and filter to cards legal in any active format."""
+    if formats is None:
+        formats = ACTIVE_FORMATS
+
     log.info("Loading %s ...", path)
     with open(path, "r", encoding="utf-8") as f:
         raw = json.load(f)
@@ -115,12 +133,16 @@ def load_and_filter(path: Path) -> pd.DataFrame:
 
     records = []
     for card in raw:
-        record = _card_to_record(card)
+        record = _card_to_record(card, formats=formats)
         if record is not None:
             records.append(record)
 
     df = pd.DataFrame(records)
-    log.info("Standard-legal cards from bulk data: %d", len(df))
+    log.info("Cards legal in %s: %d", formats, len(df))
+    for fmt in formats:
+        col = f"legal_{fmt}"
+        if col in df.columns:
+            log.info("  %s-legal: %d", fmt, df[col].sum())
     return df
 
 
@@ -227,10 +249,10 @@ def normalize(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def run(force_download: bool = False) -> pd.DataFrame:
+def run(force_download: bool = False, formats: list[str] | None = None) -> pd.DataFrame:
     """Full pipeline: download → filter → normalize → save."""
     path = download_bulk_data(force=force_download)
-    df = load_and_filter(path)
+    df = load_and_filter(path, formats=formats)
 
     df = normalize(df)
 

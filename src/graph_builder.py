@@ -1,12 +1,14 @@
 """Phase 3: Build a PyTorch Geometric HeteroData graph from all processed data.
 
 Assembles three node types (Card, Archetype, Set) and multiple edge types
-into a single heterogeneous graph suitable for GNN training.
+into a single heterogeneous graph suitable for GNN training.  Supports
+multiple formats (Standard, Pioneer, etc.) in a unified graph with
+format-prefixed archetype nodes.
 
 Node types:
-  - card:       ~4,168 Standard-legal cards (407-dim: 384 embedding + 23 scalar)
-  - archetype:  ~10 meta archetypes (14-dim: 6 color flags + 8 type ratios)
-  - set:        ~12-16 Standard-legal sets (385-dim: 384 avg embedding + 1 recency)
+  - card:       All cards legal in any active format (407-dim: 384 embedding + 23 scalar)
+  - archetype:  Top archetypes per format (16-dim: 6 color + 8 type + N format flags)
+  - set:        All sets containing legal cards (385-dim: 384 avg embedding + 1 recency)
 
 Edge types (11):
   - (card, keyword_synergy, card)        — complementary keywords (undirected)
@@ -35,6 +37,7 @@ import torch
 from torch_geometric.data import HeteroData
 
 from src.config import (
+    ACTIVE_FORMATS,
     CARD_EMBEDDINGS_PATH,
     CARD_EMBEDDING_INDEX_PATH,
     CARDS_PARQUET,
@@ -48,30 +51,15 @@ from src.config import (
     METAGAME_PARQUET,
     REMOVAL_EDGES_PATH,
     SEMANTIC_EDGES_PATH,
+    SUPPORTED_FORMATS,
+    format_path,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-# ── Standard-legal sets: authoritative list from whatsinstandard.com ──
-STANDARD_LEGAL_SET_CODES = {
-    "woe",   # Wilds of Eldraine
-    "lci",   # The Lost Caverns of Ixalan
-    "mkm",   # Murders at Karlov Manor
-    "otj",   # Outlaws of Thunder Junction
-    "big",   # The Big Score
-    "blb",   # Bloomburrow
-    "dsk",   # Duskmourn: House of Horror
-    "fdn",   # Foundations (evergreen, exits Q1 2030)
-    "dft",   # Aetherdrift
-    "tdm",   # Tarkir: Dragonstorm
-    "fin",   # Final Fantasy
-    "eoe",   # Edge of Eternities
-    "spm",   # Marvel's Spider-Man
-    "tla",   # Avatar: The Last Airbender
-    "ecl",   # Lorwyn Eclipsed
-    "tmt",   # Teenage Mutant Ninja Turtles
-}
+# Set codes are now discovered dynamically from cards.parquet
+# (all sets containing at least one legal card get a set node).
 
 # ── Basic land names ──
 BASIC_LAND_NAMES = {"Plains", "Island", "Swamp", "Mountain", "Forest"}
@@ -156,7 +144,6 @@ def _load_sets(
     Returns (set_codes, set_names, set_code_to_idx, set_features_tensor).
     """
     set_info = []
-    skipped_sets = []
 
     for set_code in cards["set"].unique():
         set_cards = cards[cards["set"] == set_code]
@@ -169,10 +156,6 @@ def _load_sets(
             valid_dates = dates.dropna()
             if len(valid_dates) > 0:
                 release_date = valid_dates.iloc[0]
-
-        if set_code.lower() not in STANDARD_LEGAL_SET_CODES:
-            skipped_sets.append((set_code, set_name, n_cards, release_date))
-            continue
 
         # Compute average card embedding for this set
         emb_list = []
@@ -188,11 +171,6 @@ def _load_sets(
             "release_date": release_date,
             "avg_embedding": avg_emb,
         })
-
-    if skipped_sets:
-        n_cards_skipped = sum(s[2] for s in skipped_sets)
-        log.info(f"  Skipped {len(skipped_sets)} non-Standard sets "
-                 f"({n_cards_skipped} cards without set edges)")
 
     set_df = pd.DataFrame(set_info)
     set_df["release_date"] = pd.to_datetime(set_df["release_date"], errors="coerce")
@@ -223,28 +201,96 @@ def _load_sets(
     return set_codes, set_names, set_code_to_idx, torch.tensor(features)
 
 
+def _load_multi_format_data(
+    formats: list[str] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Load metagame, decklists, and matchups from all active format subdirs.
+
+    Adds a ``format`` column if not already present and prefixes archetype
+    names with ``format::`` to avoid collisions across formats.
+    """
+    if formats is None:
+        formats = ACTIVE_FORMATS
+
+    all_meta, all_dl, all_matchups = [], [], []
+
+    for fmt in formats:
+        meta_path = format_path(METAGAME_PARQUET, fmt)
+        dl_path = format_path(DECKLISTS_PARQUET, fmt)
+        matchup_path = format_path(MATCHUPS_PARQUET, fmt)
+
+        if meta_path.exists():
+            df = pd.read_parquet(meta_path)
+            if "format" not in df.columns:
+                df["format"] = fmt
+            all_meta.append(df)
+
+        if dl_path.exists():
+            df = pd.read_parquet(dl_path)
+            if "format" not in df.columns:
+                df["format"] = fmt
+            all_dl.append(df)
+
+        if matchup_path.exists():
+            df = pd.read_parquet(matchup_path)
+            if "format" not in df.columns:
+                df["format"] = fmt
+            all_matchups.append(df)
+
+    metagame = pd.concat(all_meta, ignore_index=True) if all_meta else pd.DataFrame()
+    decklists = pd.concat(all_dl, ignore_index=True) if all_dl else pd.DataFrame()
+    matchups = pd.concat(all_matchups, ignore_index=True) if all_matchups else pd.DataFrame()
+
+    # Prefix archetype names with format to prevent collisions
+    if not metagame.empty:
+        metagame["archetype"] = metagame["format"] + "::" + metagame["archetype"]
+    if not decklists.empty:
+        decklists["archetype"] = decklists["format"] + "::" + decklists["archetype"]
+    if not matchups.empty:
+        matchups["archetype_a"] = matchups["format"] + "::" + matchups["archetype_a"]
+        matchups["archetype_b"] = matchups["format"] + "::" + matchups["archetype_b"]
+
+    return metagame, decklists, matchups
+
+
 def _load_archetypes(
     metagame: pd.DataFrame,
     decklists: pd.DataFrame,
     cards_df: pd.DataFrame,
 ) -> tuple[list, dict, torch.Tensor]:
-    """Build archetype nodes with color flags and type ratios.
+    """Build archetype nodes with color flags, type ratios, and format one-hot.
 
-    Features per archetype (14-dim):
+    Features per archetype (14 + N_formats):
       - contains_white, contains_blue, contains_black, contains_red,
         contains_green, contains_colorless (6 binary)
       - creature_ratio, instant_ratio, sorcery_ratio, land_ratio,
         planeswalker_ratio, enchantment_ratio, artifact_ratio, battle_ratio (8 continuous)
+      - is_standard, is_pioneer, ... (one-hot per supported format)
 
     Returns (archetype_names, arch_name_to_idx, arch_features_tensor).
     """
-    latest = metagame.sort_values("snapshot_date").groupby("archetype").last().reset_index()
+    format_list = list(SUPPORTED_FORMATS.keys())
+    n_format_flags = len(format_list)
 
-    # Take top N archetypes by meta share (no minimum threshold)
-    latest = latest.dropna(subset=["meta_share_pct"])
-    latest = latest.nlargest(DECK_NUM_ARCHETYPES, "meta_share_pct")
-    archetype_names = sorted(latest["archetype"].tolist())
-    log.info(f"  {len(archetype_names)} archetypes (top {DECK_NUM_ARCHETYPES} by meta share)")
+    # Select top N archetypes per format by meta share
+    selected_archetypes = []
+    for fmt in format_list:
+        fmt_meta = metagame[metagame["format"] == fmt] if "format" in metagame.columns else metagame
+        if fmt_meta.empty:
+            continue
+        latest = fmt_meta.sort_values("snapshot_date").groupby("archetype").last().reset_index()
+        latest = latest.dropna(subset=["meta_share_pct"])
+        num_arch = SUPPORTED_FORMATS[fmt].get("num_archetypes", DECK_NUM_ARCHETYPES)
+        if num_arch > 0:
+            top = latest.nlargest(num_arch, "meta_share_pct")
+        else:
+            top = latest.sort_values("meta_share_pct", ascending=False)
+        selected_archetypes.extend(top["archetype"].tolist())
+        log.info(f"  {fmt}: {len(top)} archetypes"
+                 f"{f' (top {num_arch} by meta share)' if num_arch > 0 else ' (all available)'}")
+
+    archetype_names = sorted(set(selected_archetypes))
+    log.info(f"  Total archetypes across all formats: {len(archetype_names)}")
     arch_name_to_idx = {name: i for i, name in enumerate(archetype_names)}
 
     # Card color identity lookup
@@ -256,10 +302,13 @@ def _load_archetypes(
         card_types[row["name"]] = str(row.get("type_line", ""))
 
     n_archetypes = len(archetype_names)
-    features = np.zeros((n_archetypes, 14), dtype=np.float32)
+    feat_dim = 14 + n_format_flags
+    features = np.zeros((n_archetypes, feat_dim), dtype=np.float32)
 
     for arch in archetype_names:
         idx = arch_name_to_idx[arch]
+
+        # Look up cards using the format-prefixed name in decklists
         arch_cards = decklists.loc[decklists["archetype"] == arch, "card_name"].unique()
         n_cards = max(len(arch_cards), 1)
 
@@ -283,7 +332,6 @@ def _load_archetypes(
         features[idx, 2] = float("B" in all_colors)
         features[idx, 3] = float("R" in all_colors)
         features[idx, 4] = float("G" in all_colors)
-        # contains_colorless: has colorless non-land cards
         has_colorless = any(
             len(card_colors.get(c, set())) == 0 and "Land" not in card_types.get(c, "")
             for c in arch_cards
@@ -300,8 +348,14 @@ def _load_archetypes(
         features[idx, 12] = type_counts["Artifact"] / n_cards
         features[idx, 13] = type_counts["Battle"] / n_cards
 
+        # Format one-hot flags (N_formats)
+        arch_format = arch.split("::")[0] if "::" in arch else ""
+        for fi, fmt in enumerate(format_list):
+            features[idx, 14 + fi] = float(arch_format == fmt)
+
     features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
-    log.info(f"  Archetype features: {features.shape} (6 color flags + 8 type ratios)")
+    log.info(f"  Archetype features: {features.shape} "
+             f"(6 color + 8 type + {n_format_flags} format flags)")
     return archetype_names, arch_name_to_idx, torch.tensor(features)
 
 
@@ -392,7 +446,8 @@ def _build_card_interaction_edges(card_name_to_idx: dict) -> dict:
             continue
 
         df = pd.read_parquet(path)
-        fwd_src, fwd_dst = [], []
+        has_weight = "removal_weight" in df.columns
+        fwd_src, fwd_dst, weight_list = [], [], []
         skipped = 0
 
         for _, row in df.iterrows():
@@ -403,10 +458,11 @@ def _build_card_interaction_edges(card_name_to_idx: dict) -> dict:
                 continue
             fwd_src.append(card_name_to_idx[source])
             fwd_dst.append(card_name_to_idx[target])
+            weight_list.append(float(row["removal_weight"]) if has_weight else 1.0)
 
         if fwd_src:
             fwd_index = torch.tensor([fwd_src, fwd_dst], dtype=torch.long)
-            fwd_weight = torch.ones(fwd_index.shape[1], dtype=torch.float32)
+            fwd_weight = torch.tensor(weight_list, dtype=torch.float32)
             edges[forward_type] = (fwd_index, fwd_weight)
 
             # Reverse
@@ -415,6 +471,9 @@ def _build_card_interaction_edges(card_name_to_idx: dict) -> dict:
 
             log.info(f"  {forward_type}: {fwd_index.shape[1]} edges "
                      f"(skipped {skipped} unknown cards)")
+            if has_weight:
+                log.info(f"    weight range: [{fwd_weight.min():.3f}, {fwd_weight.max():.3f}], "
+                         f"mean={fwd_weight.mean():.3f}")
         else:
             log.warning(f"  {forward_type}: no valid edges!")
 
@@ -596,10 +655,8 @@ def build_graph() -> HeteroData:
     log.info("Loading node data...")
     cards, card_name_to_idx, card_features = _load_cards()
 
-    metagame = pd.read_parquet(METAGAME_PARQUET)
-    decklists = pd.read_parquet(DECKLISTS_PARQUET)
+    metagame, decklists, matchups = _load_multi_format_data()
     cards_df = pd.read_parquet(CARDS_PARQUET)
-    matchups = pd.read_parquet(MATCHUPS_PARQUET)
 
     # Load card embeddings for set avg embedding features
     card_embeddings = np.load(CARD_EMBEDDINGS_PATH)

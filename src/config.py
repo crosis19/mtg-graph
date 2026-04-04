@@ -14,12 +14,41 @@ DATA_PROCESSED = PROJECT_ROOT / "data" / "processed"
 DATA_EMBEDDINGS = PROJECT_ROOT / "data" / "embeddings"
 RESULTS_DIR = PROJECT_ROOT / "results"
 
+# ── Multi-format support ──
+SUPPORTED_FORMATS: dict[str, dict] = {
+    "standard": {
+        "legality_key": "standard",
+        "goldfish_path": "/metagame/standard",
+        "mtgdecks_url": "https://mtgdecks.net/Standard/winrates/range:last30days",
+        "num_archetypes": 0,  # 0 = all available archetypes
+    },
+    "pioneer": {
+        "legality_key": "pioneer",
+        "goldfish_path": "/metagame/pioneer",
+        "mtgdecks_url": "https://mtgdecks.net/Pioneer/winrates/range:last30days",
+        "num_archetypes": 0,  # 0 = all available archetypes
+    },
+}
+
+ACTIVE_FORMATS: list[str] = os.getenv("ACTIVE_FORMATS", "standard,pioneer").split(",")
+
+
+def format_path(base_path: Path, fmt: str) -> Path:
+    """Insert format name into a data path for per-format namespacing.
+
+    E.g. data/processed/metagame.parquet -> data/processed/standard/metagame.parquet
+    """
+    return base_path.parent / fmt / base_path.name
+
+
 # Scryfall
 SCRYFALL_BULK_URL = os.getenv("SCRYFALL_BULK_URL", "https://api.scryfall.com/bulk-data")
 ORACLE_CARDS_PATH = DATA_RAW / "oracle_cards.json"
 
-# Processed outputs
+# Processed outputs — shared (format-agnostic)
 CARDS_PARQUET = DATA_PROCESSED / "cards.parquet"
+
+# Per-format processed outputs (use format_path() to get actual path)
 DECKLISTS_PARQUET = DATA_PROCESSED / "decklists.parquet"
 METAGAME_PARQUET = DATA_PROCESSED / "metagame.parquet"
 MATCHUPS_PARQUET = DATA_PROCESSED / "matchups.parquet"
@@ -34,7 +63,7 @@ CARD_EMBEDDING_INDEX_PATH = DATA_EMBEDDINGS / "card_embedding_index.json"
 COUNTER_EDGES_PATH = DATA_PROCESSED / "counter_edges.parquet"
 REMOVAL_EDGES_PATH = DATA_PROCESSED / "removal_edges.parquet"
 
-# Standard-legal sets filter
+# Legacy alias (kept for any external references)
 STANDARD_FORMAT = "standard"
 
 # Embedding model
@@ -44,10 +73,10 @@ SEMANTIC_SIMILARITY_THRESHOLD = float(os.getenv("SEMANTIC_SIMILARITY_THRESHOLD",
 # Rate limiting for scrapers (seconds between requests)
 SCRAPE_DELAY = float(os.getenv("SCRAPE_DELAY", "2.0"))
 
-# MTGDecks matchup data
+# MTGDecks matchup data (legacy alias — use SUPPORTED_FORMATS for multi-format)
 MTGDECKS_WINRATES_URL = os.getenv(
     "MTGDECKS_WINRATES_URL",
-    "https://mtgdecks.net/Standard/winrates/range:last30days",
+    SUPPORTED_FORMATS["standard"]["mtgdecks_url"],
 )
 
 # Graph construction
@@ -58,8 +87,15 @@ D_MODEL = int(os.getenv("D_MODEL", "128"))          # shared embedding dim for a
 D_MESSAGE = int(os.getenv("D_MESSAGE", "128"))       # message-passing hidden dim in GNN
 D_COUNT = int(os.getenv("D_COUNT", "16"))            # count embedding dim
 NUM_GNN_LAYERS = int(os.getenv("NUM_GNN_LAYERS", "2"))
-NUM_ATTN_HEADS = int(os.getenv("NUM_ATTN_HEADS", "4"))
 DROPOUT = float(os.getenv("DROPOUT", "0.1"))
+
+# Memory optimization: recompute GNN activations during backward instead of storing them.
+# Cuts GNN memory ~60% at the cost of ~25% slower backward. Recommended for large graphs.
+GRADIENT_CHECKPOINTING = bool(int(os.getenv("GRADIENT_CHECKPOINTING", "1")))
+
+# Chunked message passing: process large edge types in mini-batches to cap
+# GPU memory.  Set to 0 to disable chunking (process all edges at once).
+EDGE_CHUNK_SIZE = int(os.getenv("EDGE_CHUNK_SIZE", "2000000"))
 
 # Loss weights
 COUNT_LOSS_WEIGHT = float(os.getenv("COUNT_LOSS_WEIGHT", "1.0"))
@@ -71,20 +107,37 @@ MAX_NONBASIC_COUNT = int(os.getenv("MAX_NONBASIC_COUNT", "4"))
 
 # Training hyperparameters
 DECK_LEARNING_RATE = float(os.getenv("DECK_LEARNING_RATE", "0.0001"))
+GNN_LR_SCALE = float(os.getenv("GNN_LR_SCALE", "0.1"))  # GNN LR = base LR * this
 WEIGHT_DECAY = float(os.getenv("WEIGHT_DECAY", "0.00001"))
 DECK_NUM_EPOCHS = int(os.getenv("DECK_NUM_EPOCHS", "50"))
 DECK_PATIENCE = int(os.getenv("DECK_PATIENCE", "10"))
 DECK_RECENCY_DAYS = int(os.getenv("DECK_RECENCY_DAYS", "30"))
 DECK_WARMUP_EPOCHS = int(os.getenv("DECK_WARMUP_EPOCHS", "5"))
 DECK_LR_SCHEDULER = os.getenv("DECK_LR_SCHEDULER", "cosine")  # cosine | linear | none
-DECK_NUM_ARCHETYPES = int(os.getenv("DECK_NUM_ARCHETYPES", "16"))
+DECK_NUM_ARCHETYPES = int(os.getenv("DECK_NUM_ARCHETYPES", "0"))  # 0 = all available
 DECK_NUM_VAL_ARCHETYPES = int(os.getenv("DECK_NUM_VAL_ARCHETYPES", "3"))
 DECK_NUM_CV_FOLDS = int(os.getenv("DECK_NUM_CV_FOLDS", "5"))
 DECK_BATCH_SIZE = int(os.getenv("DECK_BATCH_SIZE", "0"))  # archetypes per step (0 = all)
+DECK_BATCH_STRATEGY = os.getenv("DECK_BATCH_STRATEGY", "random")  # "random" | "color_balanced"
+DECK_COLOR_LOSS_WEIGHTING = bool(int(os.getenv("DECK_COLOR_LOSS_WEIGHTING", "0")))
+DECK_TOP_N_ARCHETYPES = int(os.getenv("DECK_TOP_N_ARCHETYPES", "0"))  # 0 = all, N = top N per format
 DECK_VAL_EVERY = int(os.getenv("DECK_VAL_EVERY", "5"))    # epochs between validation
+
+# Curriculum negative sampling — gradually expand the decoder's candidate card
+# pool during training.  "Deck cards" (any card in any archetype's decklist) are
+# always eligible; the curriculum controls how many additional distractor cards
+# the decoder sees.  Validation always uses the full pool.
+CURRICULUM_NEG_START = int(os.getenv("CURRICULUM_NEG_START", "150"))       # initial negatives
+CURRICULUM_NEG_EPOCHS = int(os.getenv("CURRICULUM_NEG_EPOCHS", "20"))      # epochs to full pool
+CURRICULUM_NEG_SCHEDULE = os.getenv("CURRICULUM_NEG_SCHEDULE", "linear")   # linear | exponential
 
 # Legacy: still used by graph_builder for copy-count edge weight encoding
 DECK_BASIC_LAND_MAX_COPIES = int(os.getenv("DECK_BASIC_LAND_MAX_COPIES", "20"))
+
+# Transfer learning (pretrain on all formats, finetune on target format)
+TRANSFER_FINETUNE_LR_SCALE = float(os.getenv("TRANSFER_FINETUNE_LR_SCALE", "0.1"))
+TRANSFER_GNN_FREEZE_EPOCHS = int(os.getenv("TRANSFER_GNN_FREEZE_EPOCHS", "5"))
+TRANSFER_FINETUNE_EPOCHS = int(os.getenv("TRANSFER_FINETUNE_EPOCHS", "30"))
 
 # Results — each run gets a timestamped subfolder
 def create_run_dir(task: str | None = None, results_base: Path | None = None) -> Path:

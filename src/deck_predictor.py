@@ -1,4 +1,4 @@
-"""Autoregressive Deck Constructor — GNN + Cross-Attention Deck Builder.
+"""Autoregressive Deck Constructor — GNN + MLP Deck Builder.
 
 Two-stage architecture for predicting competitive 60-card MTG decklists:
 
@@ -6,12 +6,19 @@ Two-stage architecture for predicting competitive 60-card MTG decklists:
     MLP-based message passing over the heterogeneous metagame graph.
     Learns card, archetype, and set embeddings via separate MLPs per
     edge type with additive skip connections back to layer-0 embeddings.
-    Messages are scaled by edge weights from the graph before aggregation.
+    Edge weights from the graph (copy counts, synergy scores, win rates)
+    are treated as edge features concatenated with source embeddings
+    before the MessageMLP. Each edge type has a learnable scalar weight
+    that controls its overall contribution to message aggregation.
 
   Stage 2 (DeckConstructor):
     Given an archetype embedding, autoregressively selects cards and
-    predicts copy counts via cross-attention over the card pool.
-    Builds a deck one card at a time until the 60-card budget is spent.
+    predicts copy counts via MLP scoring over the card pool. At each step,
+    the archetype embedding is concatenated with the mean of previously
+    selected card+count embeddings and projected via MLP to produce a
+    fixed-size query vector. Separate count heads for non-basic cards
+    (1–4) and basic lands (1–20). Builds a deck one card at a time
+    until the 60-card budget is spent.
 
 Training uses argmax card selection with two forms of teacher forcing:
   1. Context correction: when the model selects a wrong card, a random
@@ -23,7 +30,6 @@ Training uses argmax card selection with two forms of teacher forcing:
      predicted count.
 """
 
-import math
 import random
 
 import torch
@@ -31,15 +37,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.data import HeteroData
 
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
+
 from src.config import (
     D_COUNT,
     D_MESSAGE,
     D_MODEL,
     DROPOUT,
+    EDGE_CHUNK_SIZE,
+    GRADIENT_CHECKPOINTING,
     MAX_BASIC_LAND_COUNT,
     MAX_DECK_SIZE,
     MAX_NONBASIC_COUNT,
-    NUM_ATTN_HEADS,
     NUM_GNN_LAYERS,
 )
 from src.graph_builder import BASIC_LAND_NAMES
@@ -71,14 +80,15 @@ class NodeEncoder(nn.Module):
 class MessageMLP(nn.Module):
     """Two-layer MLP for edge-type-specific message transformation.
 
-    Transforms source node embeddings (d_model) into the message space
-    (d_message) before aggregation. One instance per (edge_type, GNN_layer).
+    Transforms source node embeddings concatenated with edge features
+    (d_input = d_model + n_edge_features) into the message space (d_message)
+    before aggregation. One instance per (edge_type, GNN_layer).
     """
 
-    def __init__(self, d_model: int, d_message: int, dropout: float):
+    def __init__(self, d_input: int, d_message: int, dropout: float):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(d_model, d_message),
+            nn.Linear(d_input, d_message),
             nn.ReLU(),
             nn.Linear(d_message, d_message),
             nn.LayerNorm(d_message),
@@ -114,9 +124,11 @@ class UpdateMLP(nn.Module):
 class HeteroGNNLayer(nn.Module):
     """One round of heterogeneous message passing.
 
-    For each edge type, source embeddings are transformed by a dedicated
-    MessageMLP, scaled by edge weights (if present), mean-aggregated at
-    the destination, then all edge-type contributions are summed per node
+    For each edge type, source embeddings are concatenated with edge
+    features (the graph's edge weights treated as input features) and
+    transformed by a dedicated MessageMLP. Messages are then scaled by
+    a learnable per-edge-type scalar weight, mean-aggregated at the
+    destination, and all edge-type contributions are summed per node
     type and passed through an UpdateMLP.
     """
 
@@ -127,13 +139,20 @@ class HeteroGNNLayer(nn.Module):
         d_model: int,
         d_message: int,
         dropout: float,
+        edge_chunk_size: int = 0,
     ):
         super().__init__()
-        # One MessageMLP per edge type: d_model → d_message
+        # One MessageMLP per edge type: (d_model + 1 edge feature) → d_message
         self.message_mlps = nn.ModuleDict()
         for src, rel, dst in edge_types:
             key = f"{src}__{rel}__{dst}"
-            self.message_mlps[key] = MessageMLP(d_model, d_message, dropout)
+            self.message_mlps[key] = MessageMLP(d_model + 1, d_message, dropout)
+
+        # Learnable per-edge-type scalar weight (initialized to 1.0)
+        self.edge_type_weights = nn.ParameterDict()
+        for src, rel, dst in edge_types:
+            key = f"{src}__{rel}__{dst}"
+            self.edge_type_weights[key] = nn.Parameter(torch.ones(1))
 
         # One UpdateMLP per node type: d_message → d_model
         self.update_mlps = nn.ModuleDict()
@@ -143,6 +162,7 @@ class HeteroGNNLayer(nn.Module):
         self._edge_types = edge_types
         self._node_types = node_types
         self._d_message = d_message
+        self._edge_chunk_size = edge_chunk_size
 
     def forward(
         self,
@@ -151,6 +171,15 @@ class HeteroGNNLayer(nn.Module):
         edge_weight_dict: dict[tuple, torch.Tensor | None],
     ) -> dict[str, torch.Tensor]:
         """Compute per-node-type update vectors (before skip connection).
+
+        Edge weights from edge_weight_dict are used as input features
+        (concatenated with source embeddings before the MessageMLP), not
+        as message scaling factors. Learned per-edge-type scalars control
+        the contribution of each relationship type.
+
+        When ``edge_chunk_size > 0``, large edge types are processed in
+        mini-batches to cap GPU memory.  The scatter-add aggregation is
+        fully decomposable: ``sum(partial) / count(partial) = global mean``.
 
         Returns a dict of {node_type: update_tensor} to be added to the
         layer-0 embeddings by the caller.
@@ -161,6 +190,8 @@ class HeteroGNNLayer(nn.Module):
             for nt in self._node_types
         }
 
+        chunk = self._edge_chunk_size
+
         for src_type, rel, dst_type in self._edge_types:
             key = f"{src_type}__{rel}__{dst_type}"
             et = (src_type, rel, dst_type)
@@ -168,30 +199,78 @@ class HeteroGNNLayer(nn.Module):
                 continue
 
             edge_index = edge_index_dict[et]
+            n_edges = edge_index.shape[1]
+            n_dst = x_dict[dst_type].shape[0]
+            device = x_dict[src_type].device
+
+            # Move edge data to compute device if needed (CPU offloading)
+            if edge_index.device != device:
+                edge_index = edge_index.to(device, non_blocking=True)
             src_idx, dst_idx = edge_index[0], edge_index[1]
 
-            # Transform source embeddings with edge-type-specific MLP
-            src_emb = x_dict[src_type][src_idx]           # (n_edges, d_model)
-            messages = self.message_mlps[key](src_emb)     # (n_edges, d_message)
+            ew_raw = edge_weight_dict.get(et)
+            if ew_raw is not None and ew_raw.device != device:
+                ew_raw = ew_raw.to(device, non_blocking=True)
 
-            # Scale messages by edge weight (if available)
-            weights = edge_weight_dict.get(et)
-            if weights is not None:
-                messages = messages * weights.unsqueeze(1)  # (n_edges, 1) broadcast
+            # ── Chunked path for large edge types ──
+            if chunk > 0 and n_edges > chunk:
+                total_summed = torch.zeros(n_dst, self._d_message, device=device)
+                total_counts = torch.zeros(n_dst, 1, device=device)
 
-            # Mean aggregation at destination nodes
-            n_dst = x_dict[dst_type].shape[0]
-            # Sum messages per destination node
-            summed = torch.zeros(n_dst, self._d_message, device=messages.device)
-            summed.scatter_add_(0, dst_idx.unsqueeze(1).expand_as(messages), messages)
-            # Count incoming edges per destination for mean
-            counts = torch.zeros(n_dst, 1, device=messages.device)
-            counts.scatter_add_(0, dst_idx.unsqueeze(1), torch.ones_like(dst_idx.unsqueeze(1).float()))
-            counts = counts.clamp(min=1.0)
-            mean_msg = summed / counts
+                for start in range(0, n_edges, chunk):
+                    end = min(start + chunk, n_edges)
+                    si_c = src_idx[start:end]
+                    di_c = dst_idx[start:end]
 
-            # Accumulate across edge types targeting the same node type
+                    src_emb_c = x_dict[src_type][si_c]
+                    if ew_raw is not None:
+                        ef_c = ew_raw[start:end].unsqueeze(1)
+                    else:
+                        ef_c = torch.ones(end - start, 1, device=device)
+
+                    mlp_in_c = torch.cat([src_emb_c, ef_c], dim=1)
+                    msg_c = self.message_mlps[key](mlp_in_c)
+                    msg_c = msg_c * self.edge_type_weights[key]
+
+                    total_summed.scatter_add_(
+                        0, di_c.unsqueeze(1).expand_as(msg_c), msg_c,
+                    )
+                    total_counts.scatter_add_(
+                        0, di_c.unsqueeze(1),
+                        torch.ones_like(di_c.unsqueeze(1).float()),
+                    )
+                    del src_emb_c, ef_c, mlp_in_c, msg_c, si_c, di_c
+
+                mean_msg = total_summed / total_counts.clamp(min=1.0)
+                del total_summed, total_counts
+
+            # ── Standard path for small edge types ──
+            else:
+                src_emb = x_dict[src_type][src_idx]
+                if ew_raw is not None:
+                    edge_feat = ew_raw.unsqueeze(1)
+                else:
+                    edge_feat = torch.ones(n_edges, 1, device=device)
+
+                mlp_input = torch.cat([src_emb, edge_feat], dim=1)
+                messages = self.message_mlps[key](mlp_input)
+                messages = messages * self.edge_type_weights[key]
+                del src_emb, edge_feat, mlp_input
+
+                summed = torch.zeros(n_dst, self._d_message, device=device)
+                summed.scatter_add_(
+                    0, dst_idx.unsqueeze(1).expand_as(messages), messages,
+                )
+                counts = torch.zeros(n_dst, 1, device=device)
+                counts.scatter_add_(
+                    0, dst_idx.unsqueeze(1),
+                    torch.ones_like(dst_idx.unsqueeze(1).float()),
+                )
+                mean_msg = summed / counts.clamp(min=1.0)
+                del messages, summed, counts
+
             agg[dst_type] = agg[dst_type] + mean_msg
+            del mean_msg
 
         # Apply UpdateMLP to aggregated messages
         updates = {}
@@ -218,8 +297,12 @@ class HeteroGNN(nn.Module):
         d_message: int = D_MESSAGE,
         num_layers: int = NUM_GNN_LAYERS,
         dropout: float = DROPOUT,
+        gradient_checkpointing: bool = GRADIENT_CHECKPOINTING,
+        edge_chunk_size: int = EDGE_CHUNK_SIZE,
     ):
         super().__init__()
+        self.gradient_checkpointing = gradient_checkpointing
+
         # Per-node-type input projection
         self.encoders = nn.ModuleDict()
         for nt in node_types:
@@ -228,27 +311,47 @@ class HeteroGNN(nn.Module):
         # Message-passing layers
         self.layers = nn.ModuleList()
         for _ in range(num_layers):
-            self.layers.append(HeteroGNNLayer(edge_types, node_types, d_model, d_message, dropout))
+            self.layers.append(HeteroGNNLayer(
+                edge_types, node_types, d_model, d_message, dropout,
+                edge_chunk_size=edge_chunk_size,
+            ))
 
     def forward(self, data: HeteroData) -> dict[str, torch.Tensor]:
-        """Run GNN and return final embeddings for all node types."""
+        """Run GNN and return final embeddings for all node types.
+
+        When gradient_checkpointing is enabled, intermediate activations in
+        the message-passing layers are NOT stored during forward; they are
+        recomputed during backward. This cuts peak memory ~60% at ~25% more
+        backward compute time.
+        """
         # Layer-0 embeddings (the anchor for skip connections)
         x_dict_0 = {}
         for nt in data.node_types:
             if nt in self.encoders:
                 x_dict_0[nt] = self.encoders[nt](data[nt].x)
 
-        # Collect edge indices and weights
+        # Collect edge indices and weights — keep on CPU to save GPU memory.
+        # HeteroGNNLayer.forward() moves each edge type to GPU on demand.
         edge_index_dict = {}
         edge_weight_dict = {}
         for et in data.edge_types:
-            edge_index_dict[et] = data[et].edge_index
-            edge_weight_dict[et] = getattr(data[et], "edge_weight", None)
+            ei = data[et].edge_index
+            ew = getattr(data[et], "edge_weight", None)
+            edge_index_dict[et] = ei.cpu() if ei.is_cuda else ei
+            edge_weight_dict[et] = ew.cpu() if (ew is not None and ew.is_cuda) else ew
 
         # Message passing with additive skip to layer 0
         x_dict = {nt: x_dict_0[nt].clone() for nt in x_dict_0}
+        use_ckpt = self.gradient_checkpointing and torch.is_grad_enabled()
+
         for layer in self.layers:
-            updates = layer(x_dict, edge_index_dict, edge_weight_dict)
+            if use_ckpt:
+                updates = torch_checkpoint(
+                    layer, x_dict, edge_index_dict, edge_weight_dict,
+                    use_reentrant=False,
+                )
+            else:
+                updates = layer(x_dict, edge_index_dict, edge_weight_dict)
             for nt in x_dict:
                 if nt in updates:
                     x_dict[nt] = x_dict_0[nt] + updates[nt]
@@ -262,52 +365,58 @@ class HeteroGNN(nn.Module):
 
 
 class DeckContextEncoder(nn.Module):
-    """Encode the growing deck context into a single query vector.
+    """Encode archetype + selected-card context into a query vector.
 
-    Applies multi-head self-attention over the context (archetype embedding
-    + previously selected cards), then mean-pools to produce q_t.
+    Mean-pools the selected card embeddings and concatenates with the
+    archetype embedding, then projects via a 2-layer MLP to produce q_t.
+    Fixed-size input every step — the archetype signal is never diluted.
     """
 
-    def __init__(self, d_model: int = D_MODEL, num_heads: int = NUM_ATTN_HEADS, dropout: float = DROPOUT):
+    def __init__(self, d_model: int = D_MODEL, dropout: float = DROPOUT):
         super().__init__()
-        self.self_attn = nn.MultiheadAttention(
-            d_model, num_heads, dropout=dropout, batch_first=True,
+        self.proj = nn.Sequential(
+            nn.Linear(2 * d_model, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
+            nn.Dropout(dropout),
         )
-        self.norm = nn.LayerNorm(d_model)
+        self.d_model = d_model
 
-    def forward(self, context: torch.Tensor) -> torch.Tensor:
-        """Produce query vector q_t from deck context.
+    def forward(self, arch_emb: torch.Tensor, card_embs: torch.Tensor | None) -> torch.Tensor:
+        """Produce query vector q_t from archetype + selected card context.
 
         Args:
-            context: (seq_len, d_model) — archetype + selected cards so far.
+            arch_emb: (d_model,) — archetype embedding from GNN.
+            card_embs: (num_selected, d_model) — merged card+count embeddings
+                       selected so far, or None if no cards selected yet.
 
         Returns:
-            q_t: (d_model,) — mean-pooled context query.
+            q_t: (d_model,) — context query for card scoring.
         """
-        # Add batch dim for nn.MultiheadAttention
-        ctx = context.unsqueeze(0)                   # (1, seq_len, d_model)
-        attn_out, _ = self.self_attn(ctx, ctx, ctx)  # (1, seq_len, d_model)
-        ctx = self.norm(ctx + attn_out)              # residual + layernorm
-        q_t = ctx.squeeze(0).mean(dim=0)             # mean pool → (d_model,)
-        return q_t
+        if card_embs is not None and card_embs.shape[0] > 0:
+            card_mean = card_embs.mean(dim=0)
+        else:
+            card_mean = torch.zeros(self.d_model, device=arch_emb.device)
+        return self.proj(torch.cat([arch_emb, card_mean]))
 
 
-class CardSelector(nn.Module):
-    """Score candidate cards via multi-head cross-attention.
+class MLPCardScorer(nn.Module):
+    """Score candidate cards via MLP on context–card feature interactions.
 
-    Projects the context query q_t and card embeddings into key/query
-    subspaces, then computes scaled dot-product scores. Returns raw
-    logits (pre-softmax) for compatibility with Gumbel-softmax.
+    For each card, concatenates [q_t, card_emb, q_t * card_emb] and
+    passes through a shared MLP to produce a scalar selection logit.
+    All cards are scored in a single batched forward pass.
     """
 
-    def __init__(self, d_model: int = D_MODEL, num_heads: int = NUM_ATTN_HEADS):
+    def __init__(self, d_model: int = D_MODEL):
         super().__init__()
-        self.num_heads = num_heads
-        self.d_k = d_model // num_heads
-
-        self.W_Q = nn.Linear(d_model, d_model, bias=False)
-        self.W_K = nn.Linear(d_model, d_model, bias=False)
-        self.W_O = nn.Linear(num_heads, 1, bias=False)  # combine heads → scalar per card
+        self.mlp = nn.Sequential(
+            nn.Linear(3 * d_model, d_model),
+            nn.ReLU(),
+            nn.LayerNorm(d_model),
+        )
+        self.head = nn.Linear(d_model, 1)
 
     def forward(
         self,
@@ -325,34 +434,64 @@ class CardSelector(nn.Module):
         Returns:
             logits: (n_cards,) — raw selection scores (masked ineligible = -inf).
         """
-        n_cards = card_embeddings.shape[0]
+        # Broadcast q_t to match card count
+        q_expanded = q_t.unsqueeze(0).expand_as(card_embeddings)  # (N, d_model)
 
-        # Project query and keys into multi-head subspaces
-        Q = self.W_Q(q_t)                                     # (d_model,)
-        K = self.W_K(card_embeddings)                          # (n_cards, d_model)
+        # Concatenate context, card, and element-wise interaction
+        x = torch.cat([q_expanded, card_embeddings, q_expanded * card_embeddings], dim=-1)
 
-        # Reshape for multi-head: (num_heads, d_k) and (n_cards, num_heads, d_k)
-        Q = Q.view(self.num_heads, self.d_k)                   # (H, d_k)
-        K = K.view(n_cards, self.num_heads, self.d_k)          # (N, H, d_k)
-
-        # Scaled dot-product per head: (N, H)
-        scores = (K * Q.unsqueeze(0)).sum(dim=-1) / math.sqrt(self.d_k)
-
-        # Combine heads via learned projection → (N, 1) → (N,)
-        logits = self.W_O(scores).squeeze(-1)
+        # MLP → scalar logit per card
+        logits = self.head(self.mlp(x)).squeeze(-1)  # (N,)
 
         # Mask ineligible cards
         logits = logits.masked_fill(~mask, float("-inf"))
         return logits
 
 
-class CountPredictor(nn.Module):
-    """Predict copy count (1–20) for a selected card.
+class NonBasicCountHead(nn.Module):
+    """Predict copy count (1–4) for a selected non-basic card."""
 
-    Takes the context query, selected card embedding, and their element-wise
-    product as input. The Hadamard product enables multiplicative feature
-    interactions between deck context and card identity.
-    """
+    def __init__(self, d_model: int = D_MODEL):
+        super().__init__()
+        self.max_count = MAX_NONBASIC_COUNT
+        self.mlp = nn.Sequential(
+            nn.Linear(3 * d_model, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
+        )
+        self.head = nn.Linear(d_model, self.max_count)
+
+    def forward(
+        self,
+        q_t: torch.Tensor,
+        card_emb: torch.Tensor,
+        remaining_budget: int,
+    ) -> torch.Tensor:
+        """Produce masked count logits for non-basic cards.
+
+        Args:
+            q_t: (d_model,) — context query.
+            card_emb: (d_model,) — selected card embedding.
+            remaining_budget: cards remaining in the 60-card budget.
+
+        Returns:
+            logits: (4,) — count logits with invalid positions set to -inf.
+                    Position i corresponds to count (i+1).
+        """
+        h = torch.cat([q_t, card_emb, q_t * card_emb])
+        h = self.mlp(h)
+        logits = self.head(h)  # (4,)
+
+        max_allowed = min(self.max_count, remaining_budget)
+        mask = torch.zeros(self.max_count, dtype=torch.bool, device=logits.device)
+        mask[:max_allowed] = True
+        logits = logits.masked_fill(~mask, float("-inf"))
+        return logits
+
+
+class BasicLandCountHead(nn.Module):
+    """Predict copy count (1–20) for a selected basic land."""
 
     def __init__(self, d_model: int = D_MODEL, max_count: int = MAX_BASIC_LAND_COUNT):
         super().__init__()
@@ -369,33 +508,26 @@ class CountPredictor(nn.Module):
         self,
         q_t: torch.Tensor,
         card_emb: torch.Tensor,
-        is_basic_land: bool,
         remaining_budget: int,
     ) -> torch.Tensor:
-        """Produce masked count logits.
+        """Produce masked count logits for basic lands.
 
         Args:
             q_t: (d_model,) — context query.
             card_emb: (d_model,) — selected card embedding.
-            is_basic_land: whether the selected card is a basic land.
             remaining_budget: cards remaining in the 60-card budget.
 
         Returns:
             logits: (max_count,) — count logits with invalid positions set to -inf.
                     Position i corresponds to count (i+1).
         """
-        # Concatenate [q_t, card_emb, q_t * card_emb]
         h = torch.cat([q_t, card_emb, q_t * card_emb])
         h = self.mlp(h)
         logits = self.head(h)  # (max_count,)
 
-        # Build count validity mask
-        max_allowed = MAX_BASIC_LAND_COUNT if is_basic_land else MAX_NONBASIC_COUNT
-        max_allowed = min(max_allowed, remaining_budget)
-
+        max_allowed = min(self.max_count, remaining_budget)
         mask = torch.zeros(self.max_count, dtype=torch.bool, device=logits.device)
-        mask[:max_allowed] = True  # positions 0..max_allowed-1 → counts 1..max_allowed
-
+        mask[:max_allowed] = True
         logits = logits.masked_fill(~mask, float("-inf"))
         return logits
 
@@ -437,7 +569,7 @@ class DeckConstructor(nn.Module):
 
     Given an archetype embedding and the full card pool, iteratively:
       1. Self-attend over the current deck context
-      2. Cross-attend to score all eligible cards
+      2. Score all eligible cards via MLP
       3. Select one card via argmax
       4. Predict copy count for the selected card
       5. Context correction (training only):
@@ -453,14 +585,14 @@ class DeckConstructor(nn.Module):
         self,
         d_model: int = D_MODEL,
         d_count: int = D_COUNT,
-        num_heads: int = NUM_ATTN_HEADS,
         dropout: float = DROPOUT,
         max_count: int = MAX_BASIC_LAND_COUNT,
     ):
         super().__init__()
-        self.context_encoder = DeckContextEncoder(d_model, num_heads, dropout)
-        self.card_selector = CardSelector(d_model, num_heads)
-        self.count_predictor = CountPredictor(d_model, max_count)
+        self.context_encoder = DeckContextEncoder(d_model, dropout)
+        self.card_selector = MLPCardScorer(d_model)
+        self.nonbasic_count_head = NonBasicCountHead(d_model)
+        self.basic_land_count_head = BasicLandCountHead(d_model, max_count)
         self.count_embedding = CountEmbedding(max_count, d_count)
         self.context_merge = ContextMerge(d_model, d_count)
         self.d_model = d_model
@@ -472,6 +604,7 @@ class DeckConstructor(nn.Module):
         basic_land_mask: torch.Tensor,
         greedy: bool = False,
         target_deck: dict[int, int] | None = None,
+        curriculum_mask: torch.Tensor | None = None,
     ) -> dict:
         """Build a deck autoregressively.
 
@@ -484,6 +617,9 @@ class DeckConstructor(nn.Module):
                 during training. Context correction substitutes GT cards on
                 wrong picks; count teacher forcing uses GT counts on correct
                 picks to prevent budget drift. None disables both.
+            curriculum_mask: (n_cards,) bool — True for cards eligible in this
+                epoch's curriculum. None means all cards eligible. Only used
+                during training to restrict the decoder's candidate pool.
 
         Returns:
             dict with:
@@ -503,20 +639,23 @@ class DeckConstructor(nn.Module):
         # Track which target cards have been consumed (for context correction)
         target_remaining = set(target_deck.keys()) if target_deck else set()
 
-        # Seed context with archetype embedding
-        context = arch_embedding.unsqueeze(0)  # (1, d_model)
+        # Track selected card embeddings for context encoding
+        card_context: list[torch.Tensor] = []
 
         while budget > 0:
-            # 1. Encode context → query vector
-            q_t = self.context_encoder(context)
+            # 1. Encode archetype + card context → query vector
+            card_embs = torch.stack(card_context) if card_context else None
+            q_t = self.context_encoder(arch_embedding, card_embs)
 
             # 2. Build eligibility mask: only cards not yet selected
             eligible = ~selected  # (n_cards,) bool
+            if curriculum_mask is not None:
+                eligible = eligible & curriculum_mask
 
             if not eligible.any():
                 break  # no more eligible cards (shouldn't happen in practice)
 
-            # 3. Score all cards via cross-attention
+            # 3. Score all cards via MLP
             select_logits = self.card_selector(q_t, card_embeddings, eligible)
 
             # 4. Select a card (always argmax)
@@ -524,9 +663,12 @@ class DeckConstructor(nn.Module):
             card_emb = card_embeddings[card_idx]
             select_probs = F.softmax(select_logits, dim=-1)
 
-            # 5. Predict copy count
+            # 5. Predict copy count via type-specific head
             is_basic = basic_land_mask[card_idx].item()
-            count_logits = self.count_predictor(q_t, card_emb, is_basic, budget)
+            if is_basic:
+                count_logits = self.basic_land_count_head(q_t, card_emb, budget)
+            else:
+                count_logits = self.nonbasic_count_head(q_t, card_emb, budget)
             count_idx = count_logits.argmax().item()
             count_probs = F.softmax(count_logits, dim=-1)
 
@@ -559,7 +701,7 @@ class DeckConstructor(nn.Module):
                     sub_count_idx = sub_count - 1
                     sub_count_emb = self.count_embedding(sub_count_idx)
                     merged = self.context_merge(sub_card_emb, sub_count_emb)
-                    context = torch.cat([context, merged.unsqueeze(0)], dim=0)
+                    card_context.append(merged)
 
             # 7. Record step info for loss computation (always the model's actual pick).
             #    Include substituted_card_idx so the loss function can remove the
@@ -596,7 +738,7 @@ class DeckConstructor(nn.Module):
                     count_emb = self.count_embedding(count_idx)
 
                 merged = self.context_merge(card_emb, count_emb)
-                context = torch.cat([context, merged.unsqueeze(0)], dim=0)
+                card_context.append(merged)
 
         return {"deck": deck, "steps": steps}
 
@@ -623,8 +765,9 @@ class MTGDeckModel(nn.Module):
         d_message: int = D_MESSAGE,
         d_count: int = D_COUNT,
         num_gnn_layers: int = NUM_GNN_LAYERS,
-        num_attn_heads: int = NUM_ATTN_HEADS,
         dropout: float = DROPOUT,
+        gradient_checkpointing: bool = GRADIENT_CHECKPOINTING,
+        edge_chunk_size: int = EDGE_CHUNK_SIZE,
     ):
         super().__init__()
         self.gnn = HeteroGNN(
@@ -635,11 +778,12 @@ class MTGDeckModel(nn.Module):
             d_message=d_message,
             num_layers=num_gnn_layers,
             dropout=dropout,
+            gradient_checkpointing=gradient_checkpointing,
+            edge_chunk_size=edge_chunk_size,
         )
         self.decoder = DeckConstructor(
             d_model=d_model,
             d_count=d_count,
-            num_heads=num_attn_heads,
             dropout=dropout,
         )
 
@@ -655,6 +799,7 @@ class MTGDeckModel(nn.Module):
         archetype_idx: int,
         greedy: bool = False,
         target_deck: dict[int, int] | None = None,
+        curriculum_mask: torch.Tensor | None = None,
     ) -> dict:
         """Run full model: GNN embedding + autoregressive deck construction.
 
@@ -664,6 +809,8 @@ class MTGDeckModel(nn.Module):
             greedy: if True, use argmax without teacher forcing (inference).
             target_deck: {card_idx: count} ground truth for teacher forcing
                 during training (see DeckConstructor.forward).
+            curriculum_mask: (n_cards,) bool — curriculum eligibility mask
+                (see DeckConstructor.forward). None = all cards eligible.
 
         Returns:
             dict with 'deck' ({card_idx: count}) and 'steps' (per-step info).
@@ -674,6 +821,7 @@ class MTGDeckModel(nn.Module):
 
         return self.decoder(
             arch_emb, card_emb, self.basic_land_mask, greedy, target_deck,
+            curriculum_mask,
         )
 
     def forward_with_embeddings(
@@ -682,6 +830,7 @@ class MTGDeckModel(nn.Module):
         archetype_idx: int,
         greedy: bool = False,
         target_deck: dict[int, int] | None = None,
+        curriculum_mask: torch.Tensor | None = None,
     ) -> dict:
         """Run deck construction using pre-computed GNN embeddings.
 
@@ -694,6 +843,8 @@ class MTGDeckModel(nn.Module):
             archetype_idx: which archetype to build a deck for.
             greedy: if True, use argmax without teacher forcing (inference).
             target_deck: {card_idx: count} ground truth for teacher forcing.
+            curriculum_mask: (n_cards,) bool — curriculum eligibility mask
+                (see DeckConstructor.forward). None = all cards eligible.
 
         Returns:
             dict with 'deck' ({card_idx: count}) and 'steps' (per-step info).
@@ -703,6 +854,7 @@ class MTGDeckModel(nn.Module):
 
         return self.decoder(
             arch_emb, card_emb, self.basic_land_mask, greedy, target_deck,
+            curriculum_mask,
         )
 
     @torch.no_grad()

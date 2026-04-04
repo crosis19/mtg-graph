@@ -6,10 +6,10 @@
 
 ## 1. System Overview
 
-This architecture predicts competitive 60-card Magic: The Gathering mainboard decklists given an archetype identity. It operates in two stages:
+This architecture predicts competitive 60-card Magic: The Gathering mainboard decklists given an archetype identity. It supports multiple formats (Standard, Pioneer) in a unified graph with format-prefixed archetype nodes and shared card embeddings, enabling transfer learning across formats. It operates in two stages:
 
 1. **GNN Message Passing** — Learn card, archetype, and set embeddings from a heterogeneous metagame graph.
-2. **Autoregressive Cross-Attention Deck Construction** — An archetype embedding iteratively selects cards and predicts copy counts via cross-attention over the card pool, building a deck one card-selection at a time until the 60-card budget is exhausted.
+2. **Autoregressive MLP-Scored Deck Construction** — At each step, the archetype embedding is concatenated with the mean of previously selected card+count embeddings and projected via MLP to produce a fixed-size query vector. This query is used to score all eligible cards via MLP scoring over the card pool and predict copy counts via separate classification heads for non-basic cards (1–4) and basic lands (1–20), building a deck one card-selection at a time until the 60-card budget is exhausted.
 
 The model trains end-to-end using argmax card selection with two forms of teacher forcing: **context correction** substitutes ground-truth cards into the deck context when the model makes wrong selections, and **count teacher forcing** uses ground-truth copy counts for deck state on correct picks to prevent budget drift.
 
@@ -17,15 +17,15 @@ The model trains end-to-end using argmax card selection with two forms of teache
 
 ## 2. Input Graph Structure
 
-The input is a heterogeneous graph constructed from Scryfall card data, MTGGoldfish metagame/decklist data, and MTGDecks.net matchup data. All node embeddings are projected to dimension `d_model` (default: 128).
+The input is a heterogeneous graph constructed from Scryfall card data, MTGGoldfish metagame/decklist data, and MTGDecks.net matchup data across all active formats. Card nodes are shared; archetype nodes are format-prefixed (e.g., `standard::Azorius Control`, `pioneer::Rakdos Vampires`). All node embeddings are projected to dimension `d_model` (default: 128).
 
 ### 2.1 Node Types
 
 | Node Type | Count | Feature Dim | Description |
 |-----------|-------|-------------|-------------|
-| **Card** | ~4,168 | 407 | Individual Standard-legal MTG card. Features: 384-dim sentence-transformer embedding (oracle text + type line + keywords + mana cost via `all-MiniLM-L6-v2`) + 23 scalar features. |
-| **Archetype** | ~16 | 14 | Named deck archetype (e.g., "Azorius Control"). Top N archetypes by meta share percentage. |
-| **Set** | ~12-16 | 385 | Standard-legal expansion set. Features: 384-dim mean embedding of all cards in the set + 1 recency score. |
+| **Card** | ~4,168 (Standard) / ~8-10k (Standard+Pioneer) | 407 | Individual MTG card legal in any active format. Features: 384-dim sentence-transformer embedding (oracle text + type line + keywords + mana cost via `all-MiniLM-L6-v2`) + 23 scalar features. |
+| **Archetype** | ~16 Standard + ~32 Pioneer | 14 + N_formats | Named deck archetype, prefixed with format (e.g., `standard::Azorius Control`). Top N archetypes per format by meta share percentage. |
+| **Set** | Dynamic (all sets with legal cards) | 385 | Expansion set containing at least one legal card. Features: 384-dim mean embedding of all cards in the set + 1 recency score. Sets are discovered dynamically from the card pool. |
 
 #### Card Scalar Features (23-dim)
 
@@ -37,12 +37,13 @@ The input is a heterogeneous graph constructed from Scryfall card data, MTGGoldf
 | Color identity | 6 | `is_white`, `is_blue`, `is_black`, `is_red`, `is_green`, `is_colorless` |
 | Mana generation | 6 | `gen_white`, `gen_blue`, `gen_black`, `gen_red`, `gen_green`, `gen_colorless` (detected from oracle text) |
 
-#### Archetype Features (14-dim)
+#### Archetype Features (14 + N_formats dim)
 
 | Feature | Dim | Encoding |
 |---------|-----|----------|
 | Color presence | 6 | Binary flags: `contains_white`, `contains_blue`, `contains_black`, `contains_red`, `contains_green`, `contains_colorless` |
 | Card type ratios | 8 | Normalized: `creature_ratio`, `instant_ratio`, `sorcery_ratio`, `land_ratio`, `planeswalker_ratio`, `enchantment_ratio`, `artifact_ratio`, `battle_ratio` |
+| Format one-hot | N_formats | Binary flags per supported format (e.g., `is_standard`, `is_pioneer`). Derived from the archetype's `format::` prefix. |
 
 #### Set Features (385-dim)
 
@@ -101,12 +102,13 @@ Use MLP-based message passing with a configurable message dimension (`d_message`
 For each GNN layer `l` (default: 2 layers):
 
 ```
-message_j^(l) = AGG({ w_{k->j} * MLP_edge_type^(l)(c_k^(l)) : k in N_type(j) })
+message_j^(l) = AGG({ alpha_type^(l) * MLP_edge_type^(l)([c_k^(l) || f_{k->j}]) : k in N_type(j) })
 c_j^(l+1) = c_j^(0) + MLP_update^(l)(message_j^(l))
 ```
 
 Where:
-- `w_{k->j}` is the **edge weight** from the graph (e.g., copy count, synergy strength, win rate). Messages are scaled by their edge weight before aggregation. Edges without stored weights default to 1.0.
+- `f_{k->j}` is the **edge feature** from the graph (e.g., copy count, synergy strength, win rate), concatenated with the source embedding before the MessageMLP. Edges without stored features default to 1.0. These are semantic inputs to the MLP, not scaling factors.
+- `alpha_type^(l)` is a **learnable per-edge-type scalar weight** (one per edge type per GNN layer, initialized to 1.0). The model learns which relationship types contribute most to message aggregation.
 - `c_j^(0)` is the **original** embedding of node `j` (not the previous layer output -- this is the skip connection)
 - `AGG` is mean aggregation over neighbors
 - `MLP_edge_type^(l)` is a separate 2-layer MLP per edge type (since this is a heterogeneous graph)
@@ -116,7 +118,8 @@ Where:
 ### 3.2 MLP Specifications
 
 **MessageMLP** (one per edge type per layer):
-- Projects from node space to message space: `d_model -> d_message -> d_message`
+- Takes source embedding concatenated with edge feature: `(d_model + 1) -> d_message -> d_message`
+- Edge features (graph edge weights such as copy counts, synergy scores, win rates) are concatenated as input features, not used as scaling factors
 - ReLU activation between layers
 - LayerNorm after the final layer
 - Dropout (default: 0.1)
@@ -134,10 +137,12 @@ Setting `d_message = d_model` recovers the standard same-dimension message passi
 Since different edge types carry different semantic meaning, use **separate message MLPs per edge type**. If a node receives messages from multiple edge types, aggregate each type independently (mean per type) and then sum:
 
 ```
-message_j^(l) = SUM_{type} MEAN({ w_{k->j} * MLP_type^(l)(c_k^(l)) : k in N_type(j) })
+message_j^(l) = SUM_{type} alpha_type^(l) * MEAN({ MLP_type^(l)([c_k^(l) || f_{k->j}]) : k in N_type(j) })
 ```
 
-Edge weights are computed during graph construction and stored per edge type. Messages are scaled by these weights before mean aggregation, so higher-weight edges (e.g., 4-copy cards, strong synergies, high win rates) send proportionally stronger signals. Edge types without stored weights (or edges with weight 1.0 such as `printed_in`/`member_of`) pass through unscaled.
+Edge weights from the graph (copy counts, synergy scores, win rates) are treated as **edge features** concatenated with source embeddings before the MessageMLP. This allows the MLP to learn nonlinear, weight-dependent transformations rather than simple magnitude scaling. Edge types without stored features default to 1.0.
+
+Each edge type has a **learnable scalar weight** `alpha_type^(l)` (one per edge type per GNN layer, initialized to 1.0) that scales messages after the MLP. This allows the model to learn which relationship types are most informative for each layer of message passing.
 
 ### 3.4 Output
 
@@ -158,62 +163,63 @@ Given an archetype embedding `a_i`, the model constructs a deck through the foll
 
 ```
 Initialize:
-    D_0 = [a_i]                     # deck context starts with just the archetype
+    a_i                              # archetype embedding (fixed throughout)
+    card_context = []                # list of selected card+count embeddings
     budget = 60                      # remaining card slots
     selected = {}                    # set of already-selected card indices
     deck = {}                        # card_index -> count mapping
 
 Loop (step t = 0, 1, 2, ...):
-    1. Compute context query q_t from D_t
-    2. Score all eligible candidate cards via cross-attention
+    1. Compute context query q_t from [a_i, mean(card_context)] via MLP
+    2. Score all eligible candidate cards via MLP scoring
     3. Select card s_t (highest scoring eligible card)
     4. Predict count n_t for selected card
     5. Context correction (training only):
         - If s_t is NOT in the target deck and remaining GT cards exist:
           substitute a random remaining target card into the context
         - Otherwise: use the model's selection
-    6. Update D_{t+1}, budget, selected, deck
-    7. If budget == 0: terminate and return deck
+    6. Append count-conditioned card embedding to card_context
+    7. Update budget, selected, deck
+    8. If budget == 0: terminate and return deck
 ```
 
 ### 4.2 Context Aggregation
 
-At step `t`, the deck context `D_t` is a sequence of embeddings: the archetype embedding plus all previously selected card embeddings (count-conditioned). Stack these into a matrix `D_t in R^{(t+1) x d_model}`.
-
-Apply a **self-attention block** over `D_t` to produce a context-aware representation:
+At step `t`, the deck context consists of the archetype embedding `a_i` (fixed throughout) and a list of previously selected card+count embeddings. Rather than attending over a growing sequence, the selected card embeddings are mean-pooled into a single summary vector and concatenated with the archetype embedding. A 2-layer MLP projects this fixed-size input into the query vector `q_t`:
 
 ```
-D_t_attn = MultiHeadSelfAttention(D_t) + D_t     # with residual connection
-D_t_norm = LayerNorm(D_t_attn)
-q_t = MeanPool(D_t_norm) in R^{d_model}
+card_mean = MeanPool(card_context) in R^{d_model}   # zero vector if no cards selected yet
+q_t = MLP_proj([a_i || card_mean]) in R^{d_model}
 ```
 
-Self-attention config:
-- Heads: 4
-- d_k = d_model / num_heads
-- Single self-attention layer (not a full transformer block -- keep it lightweight)
-- Standard residual connection + LayerNorm
+MLP projection config:
+- Input: `2 * d_model` (archetype + card mean concatenation)
+- Architecture: `Linear(2*d_model, d_model) -> ReLU -> Linear(d_model, d_model) -> LayerNorm -> Dropout`
+- Output: `d_model`
 
-The mean-pooled output `q_t` is the query vector for cross-attention over the card pool.
+This design ensures:
+- The archetype signal is always at full strength (never diluted by mean-pooling over a growing sequence)
+- The MLP input is fixed-size at every step, enabling more stable learning
+- The projection learns to combine "what am I building" (archetype) with "what have I picked so far" (card summary)
 
-### 4.3 Card Selection via Cross-Attention
+The output `q_t` is the query vector for MLP scoring over the card pool.
 
-Project the context query and candidate card embeddings:
+### 4.3 Card Selection via MLP Scoring
 
-```
-Q = q_t @ W_Q in R^{d_k}               # single query vector
-K = C_eligible @ W_K in R^{|eligible| x d_k}
-```
-
-Where `C_eligible` is the subset of card embeddings not yet selected (i.e., indices not in `selected`).
-
-Compute raw scores:
+For each candidate card, concatenate the context query with the card embedding and their element-wise product, then score via a shared MLP. All cards are scored in a single batched forward pass:
 
 ```
-scores_j = (Q . K_j) / sqrt(d_k)    for each eligible card j
+x_j = [q_t || c_j || q_t * c_j] in R^{3 * d_model}    for each card j
+score_j = Linear(MLP(x_j)) in R                         # scalar logit per card
 ```
 
-Apply masking: set `scores_j = -inf` for any card `j` that is not eligible.
+Where:
+- `||` denotes concatenation
+- `*` denotes element-wise (Hadamard) product
+- MLP: `3 * d_model -> d_model` (Linear + ReLU + LayerNorm)
+- Final linear head: `d_model -> 1`
+
+Apply masking: set `score_j = -inf` for any card `j` that is not eligible (already selected).
 
 Card selection distribution:
 
@@ -225,27 +231,29 @@ Both training and inference use `s_t = argmax_j p(j)`. During training, context 
 
 ### 4.4 Count Prediction
 
-Once card `s_t` is selected, predict how many copies to include. The count range depends on card type:
+Once card `s_t` is selected, predict how many copies to include using a **type-specific count head**. The selected card is routed to one of two separate classification heads based on whether it is a basic land:
 
-| Card Type | Valid Counts |
-|-----------|--------------|
-| Basic Land (Plains, Island, Swamp, Mountain, Forest) | 1 to min(20, remaining_budget) |
-| All other cards | 1 to min(4, remaining_budget) |
+| Card Type | Head | Output Dim | Valid Counts |
+|-----------|------|------------|--------------|
+| Basic Land (Plains, Island, Swamp, Mountain, Forest) | `BasicLandCountHead` | 20 | 1 to min(20, remaining_budget) |
+| All other cards | `NonBasicCountHead` | 4 | 1 to min(4, remaining_budget) |
 
 Note: minimum count is always 1 (if you selected it, you're including at least one copy).
 
-**Count prediction head:**
+**Count prediction heads:**
+
+Both heads share the same architecture but with different output sizes:
 
 ```
-h = MLP_count([q_t || c_{s_t} || q_t * c_{s_t}]) in R^{d_h}
-count_logits = W_count @ h + b_count in R^{20}      # 20 = max possible count
+h = MLP_count([q_t || c_{s_t} || q_t * c_{s_t}]) in R^{d_model}
+count_logits = W_count @ h + b_count in R^{K}
 ```
 
 Where:
 - `||` denotes concatenation
 - `*` denotes element-wise (Hadamard) product
 - MLP_count: `3 * d_model -> d_model -> d_model` (2-layer MLP with ReLU and LayerNorm)
-- `W_count in R^{20 x d_model}`, `b_count in R^{20}`
+- K = 4 for `NonBasicCountHead`, K = 20 for `BasicLandCountHead`
 
 **Masking invalid counts:**
 
@@ -254,9 +262,7 @@ mask_k = 0 if k is a valid count for this card, else -inf
 p(n = k | s_t, D_t) = softmax(count_logits + mask)_k
 ```
 
-For non-basic cards, mask positions 5-20 to `-inf`.
-For basic lands, mask any count exceeding `remaining_budget`.
-Always mask position 0 (count of zero is invalid -- card was selected).
+Each head masks any count exceeding `remaining_budget`.
 
 Both training and inference use `n_t = argmax_k p(n = k)`. During training, when the model selects a correct card, the ground-truth count is teacher-forced into the deck state and context update (preventing budget drift), while the model's predicted count is still used for loss computation.
 
@@ -272,24 +278,14 @@ After selecting card `s_t` with count `n_t` (or ground-truth count during traini
    - `MLP_merge`: `(d_model + d_count) -> d_model` (single linear layer + ReLU)
    - Default `d_count`: 16
 
-2. Append to context:
+2. Append to card context list:
    ```
-   D_{t+1} = stack(D_t, card_with_count)      # now shape (t+2) x d_model
+   card_context.append(card_with_count)
    ```
 
 3. Update budget: `budget -= n_t`
 
 4. Add `s_t` to `selected` set
-
-### 4.6 Multi-Head Cross-Attention
-
-Use multiple attention heads for the card selection cross-attention (default: 4 heads). Each head operates in a `d_k = d_model / num_heads` dimensional subspace with its own `W_Q^(h)`, `W_K^(h)` projections. The scores from all heads are combined via a learned output projection before the final softmax:
-
-```
-head_h = (q_t @ W_Q^(h)) . (C_eligible @ W_K^(h))^T / sqrt(d_k)
-combined = Concat(head_1, ..., head_H) @ W_O in R^{|eligible|}
-p(select j) = softmax(combined)_j
-```
 
 ---
 
@@ -345,13 +341,33 @@ The set of card indices present in `deck` is the target card set. The model's se
 
 | Feature | Description |
 |---------|-------------|
-| **AdamW optimizer** | Decoupled weight decay regularization |
-| **LR warmup + scheduling** | Linear warmup (default 5 epochs) followed by cosine annealing (also supports linear or no schedule) |
+| **AdamW optimizer** | Decoupled weight decay regularization with differential learning rates: GNN backbone uses `base_lr * gnn_lr_scale` (default 0.1), decoder uses `base_lr` |
+| **LR warmup + scheduling** | Linear warmup (default 5 epochs) followed by cosine annealing (also supports linear or no schedule). Both parameter groups share the same schedule. |
 | **Archetype-holdout cross-validation** | K-fold CV (default: 5 folds, 3 held-out archetypes per fold). Evaluates generalization to unseen archetypes. |
 | **Early stopping** | Patience-based on Jaccard metric (default: 10 validation rounds) |
 | **Gradient clipping** | `clip_grad_norm_(max_norm=1.0)` |
 | **Gradient accumulation** | Gradients accumulated across all training archetypes before optimizer step |
 | **Recency filtering** | Decklists filtered to last N days (default: 30) for freshness |
+
+### 5.5 Multi-Format Training and Transfer Learning
+
+The training pipeline supports two modes controlled by the `--mode` CLI argument:
+
+**Pre-train mode** (`--mode pretrain`, default):
+- Trains on ALL archetypes from ALL active formats in the unified graph
+- Cross-validation folds sample from the full archetype pool (Standard + Pioneer)
+- Ground truth built from all format-namespaced decklists
+- Saves checkpoint as `model_fold*.pt`
+
+**Fine-tune mode** (`--mode finetune`):
+- Loads a pre-trained model checkpoint (`--pretrained-path`)
+- Filters ground truth to a target format (`--format-filter standard`)
+- Reduces learning rate by `TRANSFER_FINETUNE_LR_SCALE` (default: 0.1x)
+- **GNN freeze strategy**: Freezes `model.gnn.parameters()` for the first `TRANSFER_GNN_FREEZE_EPOCHS` (default: 5) epochs, then unfreezes. This lets the decoder adapt to format-specific patterns while preserving card representations learned during pre-training.
+- Cross-validation over target format archetypes only
+- Fewer epochs (`TRANSFER_FINETUNE_EPOCHS`, default: 30)
+
+**Rationale**: Pioneer provides 2-3x more competitive archetypes and diverse deck compositions. Pre-training on this larger dataset yields richer card embeddings that transfer well to Standard, since Pioneer is a superset of Standard's card pool. The GNN freezing strategy prevents catastrophic forgetting of card relationships while allowing the decoder to specialize.
 
 ---
 
@@ -362,14 +378,15 @@ Input: archetype_index i
 Output: deck dictionary {card_index: count}
 
 1. Run GNN forward pass to get all card/archetype/set embeddings
-2. Initialize D_0 = [a_i], budget = 60, selected = {}, deck = {}
+2. Initialize a_i = archetype embedding, card_context = [], budget = 60, selected = {}, deck = {}
 3. While budget > 0:
-    a. Self-attend over D_t -> q_t
-    b. Score all eligible cards via cross-attention
+    a. q_t = MLP_proj([a_i || mean(card_context)])  (zero vector if empty)
+    b. Score all eligible cards via MLP scoring
     c. s_t = argmax(scores)
     d. Predict count: n_t = argmax(count_logits) (after masking invalid counts)
     e. Clamp: n_t = min(n_t, budget)
-    f. Update context, budget, selected, deck
+    f. Append count-conditioned card embedding to card_context
+    g. Update budget, selected, deck
 4. Return deck
 ```
 
@@ -389,10 +406,9 @@ For higher-quality predictions, maintain `B` candidate partial decks at each ste
 | `d_message` | 128 | GNN message-passing hidden dimension. Can differ from `d_model` for bottleneck/expansion. |
 | `d_count` | 16 | Count embedding dimension |
 | `num_gnn_layers` | 2 | Message-passing rounds |
-| `num_attn_heads` | 4 | For both self-attention and cross-attention |
-| `d_k` | 32 | = d_model / num_attn_heads |
-| `dropout` | 0.1 | Applied in MLPs and attention |
-| `learning_rate` | 1e-4 | AdamW optimizer |
+| `dropout` | 0.1 | Applied in MLPs |
+| `learning_rate` | 1e-4 | AdamW optimizer (decoder base LR) |
+| `gnn_lr_scale` | 0.1 | GNN LR = `learning_rate * gnn_lr_scale`. Lower LR stabilizes embeddings. Set to 1.0 for uniform LR. |
 | `weight_decay` | 1e-5 | Decoupled L2 regularization |
 | `count_loss_weight` | 1.0 | Lambda for count loss term |
 | `max_deck_size` | 60 | Mainboard only |
@@ -421,10 +437,11 @@ The following PyTorch `nn.Module` classes comprise the implementation:
 
 ### 8.2 `MessageMLP`
 - Edge-type-specific message transformation in GNN
-- Projects from node space to message space: `d_model -> d_message -> d_message`
+- Takes source embeddings concatenated with edge features: `(d_model + 1) -> d_message -> d_message`
+- Edge features (graph edge weights) are treated as input features, not scaling factors
 - ReLU + LayerNorm + Dropout
 - One instance per (edge_type, GNN_layer)
-- Input: source node embeddings `R^{d_model}`
+- Input: source node embeddings concatenated with edge feature `R^{d_model + 1}`
 - Output: messages `R^{d_message}`
 
 ### 8.3 `UpdateMLP`
@@ -437,9 +454,11 @@ The following PyTorch `nn.Module` classes comprise the implementation:
 
 ### 8.4 `HeteroGNNLayer`
 - One message-passing round with separate MessageMLPs per edge type
+- Edge features (graph weights) concatenated with source embeddings before MessageMLP
+- Learnable per-edge-type scalar weight scales messages after the MLP (initialized to 1.0)
 - Mean aggregation per edge type, then sum across types targeting same node
 - UpdateMLP per node type processes aggregated messages
-- Input: node embeddings `{type: R^{N x d_model}}`, edge indices per type
+- Input: node embeddings `{type: R^{N x d_model}}`, edge indices and features per type
 - Output: per-node-type update vectors `{type: R^{N x d_model}}`
 
 ### 8.5 `HeteroGNN`
@@ -449,26 +468,31 @@ The following PyTorch `nn.Module` classes comprise the implementation:
 - Output: final embeddings for all node types `{type: R^{N x d_model}}`
 
 ### 8.6 `DeckContextEncoder`
-- Multi-head self-attention over the growing deck context
-- Residual connection + LayerNorm
-- Mean pooling to produce single query vector `q_t`
-- Input: `D_t in R^{(t+1) x d_model}`
+- Mean-pools selected card embeddings and concatenates with the archetype embedding
+- 2-layer MLP projection: `Linear(2*d_model, d_model) -> ReLU -> Linear(d_model, d_model) -> LayerNorm -> Dropout`
+- Fixed-size input at every step — archetype signal never diluted
+- Falls back to zero vector when no cards selected yet (step 0)
+- Input: `arch_emb in R^{d_model}`, `card_embs in R^{num_selected x d_model}` (or None)
 - Output: `q_t in R^{d_model}`
 
-### 8.7 `CardSelector`
-- Multi-head cross-attention from `q_t` to eligible card embeddings
-- Learned `W_Q`, `W_K`, `W_O` projections
-- Produces selection logits over candidate pool
+### 8.7 `MLPCardScorer`
+- MLP-based scoring of all candidate cards against the context query
+- For each card: concatenates `[q_t || c_j || q_t * c_j]` and scores via shared MLP
+- All cards scored in a single batched forward pass (parallelized on GPU)
+- `3 * d_model -> d_model` (Linear + ReLU + LayerNorm) then linear head to 1
 - Handles masking of already-selected cards (`-inf` for ineligible)
-- Input: `q_t`, `C_eligible`, eligibility mask
+- Input: `q_t in R^{d_model}`, all card embeddings `C in R^{N x d_model}`, eligibility mask
 - Output: selection logits `in R^{|cards|}`
 
-### 8.8 `CountPredictor`
-- MLP that takes `[q_t || c_{s_t} || q_t * c_{s_t}]` and produces count logits
-- `3 * d_model -> d_model -> d_model` (ReLU + LayerNorm) then linear head to 20
-- Handles masking based on card type (basic vs. non-basic) and remaining budget
-- Input: `q_t`, `c_{s_t}`, card type flag, remaining budget
-- Output: count logits `in R^{20}` (masked)
+### 8.8 `NonBasicCountHead` / `BasicLandCountHead`
+- Two separate MLP heads for count prediction, routed by card type
+- Both take `[q_t || c_{s_t} || q_t * c_{s_t}]` and produce count logits
+- `3 * d_model -> d_model -> d_model` (ReLU + LayerNorm) then linear head
+- `NonBasicCountHead`: output `in R^4` (counts 1–4)
+- `BasicLandCountHead`: output `in R^{20}` (counts 1–20)
+- Each head masks counts exceeding remaining budget
+- Input: `q_t`, `c_{s_t}`, remaining budget
+- Output: count logits (masked)
 
 ### 8.9 `CountEmbedding`
 - `nn.Embedding(20, d_count)` -- learned embedding for counts 1-20
@@ -482,12 +506,12 @@ The following PyTorch `nn.Module` classes comprise the implementation:
 
 ### 8.11 `DeckConstructor`
 - Top-level module that orchestrates the full autoregressive loop
-- Holds: `DeckContextEncoder`, `CardSelector`, `CountPredictor`, `CountEmbedding`, `ContextMerge`
+- Holds: `DeckContextEncoder`, `MLPCardScorer`, `NonBasicCountHead`, `BasicLandCountHead`, `CountEmbedding`, `ContextMerge`
 - Implements the step-by-step deck construction loop with context correction and count teacher forcing
 - Accepts optional `target_deck` for teacher forcing during training
 - Uses argmax for both card selection and count prediction
 - During training: context correction substitutes GT cards on wrong picks; count teacher forcing uses GT counts on correct picks
-- Tracks budget, selected set, target remaining set, and context matrix
+- Tracks budget, selected set, target remaining set, and card context list
 - Input: archetype embedding `a_i`, all card embeddings `C`, basic land mask, greedy flag, optional target_deck
 - Output: dict with `deck` ({card_index: count}) and `steps` (per-step logits/probs for loss)
 
@@ -505,13 +529,17 @@ The following PyTorch `nn.Module` classes comprise the implementation:
 
 ### 9.1 Phase 1: Data Ingestion
 
+Cards are shared across all formats; metagame/decklists/matchups are per-format.
+
 | Script | Input | Output | Description |
 |--------|-------|--------|-------------|
-| `ingest_cards.py` | Scryfall bulk JSON | `cards.parquet` (~4,168 cards) | Downloads oracle cards, filters to Standard-legal, normalizes features |
-| `ingest_metagame.py` | MTGGoldfish scrape | `metagame.parquet` + `decklists.parquet` | Top N archetypes by meta share, card breakdowns per archetype |
-| `ingest_matchups.py` | MTGDecks.net scrape | `matchups.parquet` | Head-to-head win rates between archetype pairs (last 30 days) |
+| `ingest_cards.py` | Scryfall bulk JSON | `cards.parquet` (shared) | Downloads oracle cards, filters to cards legal in any active format, adds per-format legality columns |
+| `ingest_metagame.py` | MTGGoldfish scrape | `{format}/metagame.parquet` + `{format}/decklists.parquet` | Top N archetypes per format by meta share, card breakdowns per archetype |
+| `ingest_matchups.py` | MTGDecks.net scrape | `{format}/matchups.parquet` | Head-to-head win rates between archetype pairs per format (last 30 days) |
 
-### 9.2 Phase 2: Edge Construction
+Per-format data is stored in `data/processed/{format}/` subdirectories. The `ingest_all.py` orchestrator calls card ingestion once (shared), then loops over `ACTIVE_FORMATS` for metagame and matchups.
+
+### 9.2 Phase 2: Edge Construction (format-agnostic)
 
 | Script | Output | Description |
 |--------|--------|-------------|
@@ -519,9 +547,11 @@ The following PyTorch `nn.Module` classes comprise the implementation:
 | `card_embeddings.py` | semantic synergy edges + `card_embeddings.npy` | Pairwise cosine similarity >= 0.65, excluding keyword-connected pairs |
 | `card_interaction_edges.py` | counter + removal edges | Regex patterns on oracle text for counterspells (8 patterns) and removal (16 patterns) |
 
+All edge construction operates on the shared card pool and is format-agnostic.
+
 ### 9.3 Phase 3: Graph Construction
 
-`graph_builder.py` assembles all nodes, features, and edges into a PyTorch Geometric `HeteroData` object saved as `graph.pt`.
+`graph_builder.py` assembles all nodes, features, and edges into a PyTorch Geometric `HeteroData` object saved as `graph.pt`. It loads metagame/decklists/matchups from all format subdirectories, prefixes archetype names with `format::`, and builds a unified multi-format graph. Set nodes are discovered dynamically from the card pool rather than a hardcoded set list.
 
 ### 9.4 Basic Land Identification
 
@@ -530,7 +560,7 @@ Hardcoded set of basic land card names:
 BASIC_LAND_NAMES = {"Plains", "Island", "Swamp", "Mountain", "Forest"}
 ```
 
-Used to set the basic land mask per card, which controls count masking in `CountPredictor`.
+Used to set the basic land mask per card, which controls routing between `NonBasicCountHead` and `BasicLandCountHead`.
 
 ---
 
@@ -550,11 +580,11 @@ Used to set the basic land mask per card, which controls count masking in `Count
 
 ## 11. Key Design Decisions and Rationale
 
-1. **Additive skip connections in GNN:** Prevents embedding drift over message-passing rounds. The cross-attention in Stage 2 needs embeddings that still encode "what card this is," not just "what this card's neighborhood looks like."
+1. **Additive skip connections in GNN:** Prevents embedding drift over message-passing rounds. The MLP card scorer in Stage 2 needs embeddings that still encode "what card this is," not just "what this card's neighborhood looks like."
 
 2. **Configurable message dimension (`d_message`):** Decouples the GNN message-passing capacity from the node embedding dimension. A bottleneck (`d_message < d_model`) can regularize message passing; an expansion (`d_message > d_model`) increases representational capacity in the message space without affecting the rest of the architecture.
 
-3. **Self-attention over deck context (not addition):** Addition is lossy -- after 15+ cards, a summed vector cannot distinguish which specific cards are present. Self-attention preserves compositional structure and enables the model to learn inter-card dependencies.
+3. **Split-pool context with MLP projection (not self-attention over growing sequence):** The archetype embedding and mean of selected card embeddings are concatenated and projected via a 2-layer MLP. This gives the model a fixed-size input at every step, preserves the archetype signal at full strength regardless of how many cards have been selected, and avoids the learning instability of self-attention over variable-length sequences (1 to ~25 tokens). The MLP learns to combine "what archetype am I building" with "what does my deck look like on average so far."
 
 4. **Context correction during training:** Pure self-prediction causes error snowballing -- one wrong card pollutes the context, causing subsequent picks to go further off-track. Substituting a random ground-truth card into the context keeps the autoregressive state grounded while the loss still penalizes the wrong selection. This is a form of partial teacher forcing that applies only to the context, not to the loss or selection mechanism.
 
@@ -562,10 +592,24 @@ Used to set the basic land mask per card, which controls count masking in `Count
 
 6. **Classification over regression for counts:** Card count distributions are non-smooth (a card is often 0 or 4, rarely 2). Classification with masking respects both the discrete nature and the domain constraints.
 
-7. **Hadamard product in count predictor:** The element-wise product `q_t * c_{s_t}` enables the MLP to learn multiplicative feature interactions between the deck context and the candidate card, which is more expressive than concatenation alone.
+7. **Hadamard product in card scorer and count heads:** The element-wise product `q_t * c_j` enables the MLPs to learn multiplicative feature interactions between the deck context and the candidate card, which is more expressive than concatenation alone. Used in both the card selection MLP and both count prediction heads.
 
-8. **Count-conditioned context update:** Embedding a card as "3 copies of Sheoldred" rather than just "Sheoldred" lets subsequent attention steps reason about deck composition more precisely (e.g., "I already have 3 Sheoldred, so I don't need more top-end threats").
+8. **Separate count heads for basic vs non-basic:** Non-basic counts (1–4) and basic land counts (1–20) have very different distributions. Separate heads give each sub-problem the right-sized output space, eliminating masking gymnastics and allowing each to specialize.
 
-9. **Archetype-holdout cross-validation:** Evaluates whether the model can generalize to unseen archetypes, which is the realistic deployment scenario when new archetypes emerge in the metagame.
+9. **Count-conditioned context update:** Embedding a card as "3 copies of Sheoldred" rather than just "Sheoldred" lets subsequent attention steps reason about deck composition more precisely (e.g., "I already have 3 Sheoldred, so I don't need more top-end threats").
 
-10. **Multi-source graph edges:** Keyword synergy, semantic synergy, counter/removal interactions, set membership, deck composition, and matchup data each provide different structural signals. Separate MessageMLPs per edge type allow the GNN to learn type-specific transformations.
+10. **Archetype-holdout cross-validation:** Evaluates whether the model can generalize to unseen archetypes, which is the realistic deployment scenario when new archetypes emerge in the metagame.
+
+11. **Multi-source graph edges:** Keyword synergy, semantic synergy, counter/removal interactions, set membership, deck composition, and matchup data each provide different structural signals. Separate MessageMLPs per edge type allow the GNN to learn type-specific transformations.
+
+12. **Edge weights as features, not scaling factors:** Graph edge weights (copy counts, synergy scores, win rates) encode semantic information that shouldn't be used as simple magnitude scaling. A copy count of 0.75 (meaning 3 copies) shouldn't halve the message strength. Concatenating these values as input features to the MessageMLP lets the model learn nonlinear, weight-dependent transformations.
+
+13. **Learnable per-edge-type weights:** A single learnable scalar per edge type per GNN layer controls the overall contribution of each relationship type to message aggregation. This lets the model discover which edge types are most informative (e.g., synergy edges vs. matchup edges) without overfitting to individual edges. Per-edge-type weights generalize to new graphs (new cards, meta shifts) since they are tied to relationship types, not specific edge instances.
+
+14. **Differential learning rates (GNN vs decoder):** The GNN backbone learns foundational graph representations that all downstream predictions depend on — unstable GNN updates ripple into every card selection. The decoder gets direct loss gradients, while the GNN receives more diffuse gradients that flow back through cached embeddings. A lower LR for the GNN (default: 10% of base LR) stabilizes embedding learning while letting the decoder adapt faster. The `gnn_lr_scale` multiplier (1.0 = uniform LR) is included in hyperparameter sweeps.
+
+15. **Unified multi-format graph with format-prefixed archetypes:** Card-to-card edges (synergy, counters, removal) derive from oracle text and are format-agnostic — sharing them avoids redundant computation and enables cross-format learning. Archetype names are prefixed with `format::` (e.g., `standard::Mono-Red Aggro`, `pioneer::Rakdos Vampires`) to prevent collisions, since the same archetype name can exist in both formats with different card compositions. Format one-hot flags in archetype features let the model distinguish formats without separate graphs.
+
+16. **Dynamic set discovery over hardcoded set lists:** Rather than maintaining a static list of legal set codes (which requires manual updates each set release), set nodes are created for every set code found in the card pool. This automatically handles set rotations and multi-format set overlap.
+
+17. **Transfer learning via GNN freezing:** During fine-tuning, the GNN is frozen for the first N epochs while the decoder adapts to the target format. This prevents catastrophic forgetting of card relationship patterns learned during pre-training while allowing the autoregressive decoder to specialize. After unfreezing, the GNN fine-tunes at a reduced learning rate.

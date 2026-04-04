@@ -24,14 +24,26 @@ import torch.nn.functional as F
 import torch_geometric  # noqa: F401 — must be fully loaded before torch.load unpickles HeteroData
 
 from src.config import (
+    ACTIVE_FORMATS,
     CARDS_PARQUET,
     COUNT_LOSS_WEIGHT,
+    CURRICULUM_NEG_EPOCHS,
+    CURRICULUM_NEG_SCHEDULE,
+    CURRICULUM_NEG_START,
     D_COUNT,
     D_MESSAGE,
     D_MODEL,
     DECK_BATCH_SIZE,
+    DECK_BATCH_STRATEGY,
+    DECK_COLOR_LOSS_WEIGHTING,
     DECK_LEARNING_RATE,
+    DECK_TOP_N_ARCHETYPES,
     DECK_LR_SCHEDULER,
+    DECKLISTS_PARQUET,
+    DROPOUT,
+    METAGAME_PARQUET,
+    EDGE_CHUNK_SIZE,
+    GNN_LR_SCALE,
     DECK_NUM_CV_FOLDS,
     DECK_NUM_EPOCHS,
     DECK_NUM_VAL_ARCHETYPES,
@@ -39,15 +51,16 @@ from src.config import (
     DECK_RECENCY_DAYS,
     DECK_VAL_EVERY,
     DECK_WARMUP_EPOCHS,
-    DECKLISTS_PARQUET,
-    DROPOUT,
     GRAPH_PATH,
     MAX_BASIC_LAND_COUNT,
     MAX_NONBASIC_COUNT,
-    NUM_ATTN_HEADS,
     NUM_GNN_LAYERS,
+    TRANSFER_FINETUNE_EPOCHS,
+    TRANSFER_FINETUNE_LR_SCALE,
+    TRANSFER_GNN_FREEZE_EPOCHS,
     WEIGHT_DECAY,
     create_run_dir,
+    format_path,
 )
 from src.deck_predictor import MTGDeckModel
 from src.graph_builder import BASIC_LAND_NAMES
@@ -152,6 +165,72 @@ def _build_ground_truth(
         log.info(f"  Archetype {arch_names[a_idx]}: {len(cards)} unique cards, {total} total copies")
 
     return ground_truth
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Curriculum Negative Sampling
+# ════════════════════════════════════════════════════════════════════
+
+
+def _identify_deck_and_negative_cards(
+    ground_truth: dict[int, dict[int, int]],
+    total_cards: int,
+) -> tuple[set[int], list[int]]:
+    """Partition card indices into deck cards and negatives.
+
+    Deck cards = any card appearing in at least one archetype's ground-truth
+    decklist. Negatives = all other cards in the graph.
+    """
+    deck_cards: set[int] = set()
+    for cards in ground_truth.values():
+        deck_cards.update(cards.keys())
+    negative_cards = sorted(set(range(total_cards)) - deck_cards)
+    return deck_cards, negative_cards
+
+
+def _compute_curriculum_mask(
+    epoch: int,
+    deck_card_set: set[int],
+    negative_cards: list[int],
+    total_cards: int,
+    neg_start: int,
+    neg_epochs: int,
+    schedule: str,
+) -> torch.Tensor:
+    """Build a boolean mask over all cards for this epoch's curriculum.
+
+    All deck cards are always eligible. The number of additional negative
+    (distractor) cards grows from *neg_start* to all negatives over
+    *neg_epochs* epochs, then stays at the full pool.
+
+    Returns a CPU bool tensor of shape (total_cards,).
+    """
+    total_neg = len(negative_cards)
+
+    # After curriculum period or no negatives — full pool
+    if epoch >= neg_epochs or total_neg == 0:
+        return torch.ones(total_cards, dtype=torch.bool)
+
+    # Clamp start to available negatives
+    neg_start = min(neg_start, total_neg)
+
+    # Compute how many negatives this epoch
+    frac = epoch / neg_epochs
+    if schedule == "exponential" and neg_start > 0:
+        n_neg = int(neg_start * (total_neg / neg_start) ** frac)
+    else:  # linear (default)
+        n_neg = int(neg_start + (total_neg - neg_start) * frac)
+    n_neg = min(n_neg, total_neg)
+
+    # Sample a random subset for diversity across epochs
+    sampled = set(random.sample(negative_cards, n_neg))
+
+    mask = torch.zeros(total_cards, dtype=torch.bool)
+    for idx in deck_card_set:
+        mask[idx] = True
+    for idx in sampled:
+        mask[idx] = True
+    return mask
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -373,6 +452,175 @@ def _create_cv_folds(
 
 
 # ════════════════════════════════════════════════════════════════════
+#  Color-Balanced Batching & Loss Weighting Helpers
+# ════════════════════════════════════════════════════════════════════
+
+COLOR_NAMES = ["W", "U", "B", "R", "G", "C"]
+
+
+def _get_archetype_color_groups(
+    data,
+    archetype_indices: list[int],
+) -> dict[str, list[int]]:
+    """Group archetypes by the card-derived color flags in the graph.
+
+    Reads the first 6 dims of archetype node features (W/U/B/R/G/colorless
+    binary flags, computed from the union of card color identities in the
+    deck). Multi-color archetypes appear in multiple buckets.
+
+    Returns dict mapping color letter -> list of archetype indices.
+    """
+    groups: dict[str, list[int]] = {c: [] for c in COLOR_NAMES}
+    for a_idx in archetype_indices:
+        flags = data["archetype"].x[a_idx, :6]
+        has_any = False
+        for i, color in enumerate(COLOR_NAMES):
+            if flags[i] > 0.5:
+                groups[color].append(a_idx)
+                has_any = True
+        if not has_any:
+            groups["C"].append(a_idx)  # colorless fallback
+    return {c: idxs for c, idxs in groups.items() if idxs}
+
+
+def _color_balanced_batches(
+    color_groups: dict[str, list[int]],
+    batch_size: int,
+    all_archetypes: list[int],
+    epoch: int,
+) -> list[list[int]]:
+    """Generate batches with approximate color balance.
+
+    Works with any batch size — no minimum required. For each batch,
+    greedily selects archetypes that best improve color coverage by
+    prioritizing underrepresented colors. Multi-color archetypes
+    contribute to all their colors simultaneously.
+
+    Every archetype is guaranteed to appear at least once per epoch.
+    """
+    rng = random.Random(42 + epoch)
+
+    # Build archetype -> set of colors mapping
+    arch_colors: dict[int, set[str]] = {}
+    for color, indices in color_groups.items():
+        for a_idx in indices:
+            arch_colors.setdefault(a_idx, set()).add(color)
+
+    # Target color distribution (proportional to how many archetypes
+    # have each color, so we're balancing relative representation)
+    active_colors = list(color_groups.keys())
+
+    # Pool of archetypes to draw from, shuffled for this epoch
+    pool = list(all_archetypes)
+    rng.shuffle(pool)
+
+    seen = set()
+    batches = []
+    pool_offset = 0  # tracks position through shuffled pool
+
+    n_batches = max((len(all_archetypes) + batch_size - 1) // batch_size, 1)
+    for _ in range(n_batches):
+        batch = []
+        # Track color counts within this batch
+        batch_color_counts = {c: 0 for c in active_colors}
+
+        for _ in range(batch_size):
+            # Score each candidate: sum of 1/(1+count) for each color it covers.
+            # This naturally prioritizes archetypes whose colors are
+            # underrepresented in the current batch.
+            best_idx = None
+            best_score = -1.0
+
+            # Check a window of candidates from the shuffled pool
+            window_size = min(len(pool), max(batch_size * 3, 10))
+            candidates = []
+            for j in range(window_size):
+                c_idx = pool[(pool_offset + j) % len(pool)]
+                candidates.append(c_idx)
+
+            for c_idx in candidates:
+                score = sum(
+                    1.0 / (1.0 + batch_color_counts.get(c, 0))
+                    for c in arch_colors.get(c_idx, set())
+                )
+                # Small tiebreaker: prefer unseen archetypes
+                if c_idx not in seen:
+                    score += 0.1
+                if score > best_score:
+                    best_score = score
+                    best_idx = c_idx
+
+            if best_idx is not None:
+                batch.append(best_idx)
+                seen.add(best_idx)
+                for c in arch_colors.get(best_idx, set()):
+                    batch_color_counts[c] = batch_color_counts.get(c, 0) + 1
+                # Advance past the picked candidate in the pool
+                pool_offset = (pool_offset + 1) % len(pool)
+
+        if batch:
+            batches.append(batch)
+
+    # If some archetypes still unseen, add a cleanup batch
+    unseen = set(all_archetypes) - seen
+    if unseen:
+        cleanup = list(unseen)
+        rng.shuffle(cleanup)
+        batches.append(cleanup)
+
+    return batches
+
+
+def _compute_color_loss_weights(
+    data,
+    archetype_indices: list[int],
+) -> dict[int, float]:
+    """Compute inverse color-frequency loss weights per archetype.
+
+    Archetypes with the same exact color identity (e.g., both WU) share
+    a group. Weight = 1 / group_size, then normalized so weights average 1.0.
+    """
+    from collections import Counter
+
+    # Map each archetype to its color identity as a frozenset
+    # Uses the card-derived color flags from the graph node features
+    arch_to_identity: dict[int, frozenset] = {}
+    for a_idx in archetype_indices:
+        flags = data["archetype"].x[a_idx, :6]
+        colors = frozenset(
+            COLOR_NAMES[i] for i in range(6) if flags[i] > 0.5
+        )
+        if not colors:
+            colors = frozenset(["C"])
+        arch_to_identity[a_idx] = colors
+
+    # Count archetypes per identity
+    identity_counts = Counter(arch_to_identity.values())
+
+    # Raw weight = inverse frequency
+    raw_weights = {
+        a_idx: 1.0 / identity_counts[identity]
+        for a_idx, identity in arch_to_identity.items()
+    }
+
+    # Normalize so weights average to 1.0
+    n = len(raw_weights)
+    total = sum(raw_weights.values())
+    scale = n / total if total > 0 else 1.0
+
+    weights = {a_idx: w * scale for a_idx, w in raw_weights.items()}
+
+    # Log distribution
+    identity_weights = {}
+    for a_idx, identity in arch_to_identity.items():
+        key = "".join(sorted(identity))
+        identity_weights[key] = weights[a_idx]
+    log.info(f"  Color loss weights: {identity_weights}")
+
+    return weights
+
+
+# ════════════════════════════════════════════════════════════════════
 #  Main Training Loop
 # ════════════════════════════════════════════════════════════════════
 
@@ -397,7 +645,6 @@ def train_deck(device=None, trial=None, **overrides):
         "d_message": overrides.get("d_message", D_MESSAGE),
         "d_count": overrides.get("d_count", D_COUNT),
         "num_gnn_layers": overrides.get("num_gnn_layers", NUM_GNN_LAYERS),
-        "num_attn_heads": overrides.get("num_attn_heads", NUM_ATTN_HEADS),
         "dropout": overrides.get("dropout", DROPOUT),
         "learning_rate": overrides.get("learning_rate", DECK_LEARNING_RATE),
         "weight_decay": overrides.get("weight_decay", WEIGHT_DECAY),
@@ -411,6 +658,14 @@ def train_deck(device=None, trial=None, **overrides):
         "n_cv_folds": overrides.get("n_cv_folds", DECK_NUM_CV_FOLDS),
         "batch_size": overrides.get("batch_size", DECK_BATCH_SIZE),
         "val_every": overrides.get("val_every", DECK_VAL_EVERY),
+        "gnn_lr_scale": overrides.get("gnn_lr_scale", GNN_LR_SCALE),
+        "curriculum_neg_start": overrides.get("curriculum_neg_start", CURRICULUM_NEG_START),
+        "curriculum_neg_epochs": overrides.get("curriculum_neg_epochs", CURRICULUM_NEG_EPOCHS),
+        "curriculum_neg_schedule": overrides.get("curriculum_neg_schedule", CURRICULUM_NEG_SCHEDULE),
+        "edge_chunk_size": overrides.get("edge_chunk_size", EDGE_CHUNK_SIZE),
+        "batch_strategy": overrides.get("batch_strategy", DECK_BATCH_STRATEGY),
+        "color_loss_weighting": overrides.get("color_loss_weighting", DECK_COLOR_LOSS_WEIGHTING),
+        "top_n_archetypes": overrides.get("top_n_archetypes", DECK_TOP_N_ARCHETYPES),
     }
 
     results_base = overrides.get("results_base", None)
@@ -422,20 +677,88 @@ def train_deck(device=None, trial=None, **overrides):
     random.seed(42)
     np.random.seed(42)
 
+    # Use module-level reference so Colab patching of config paths works
+    import src.config as _cfg
+
     # ── Load graph ──
     log.info("Loading graph...")
-    data = torch.load(GRAPH_PATH, weights_only=False)
+    data = torch.load(_cfg.GRAPH_PATH, weights_only=False)
     log.info(f"  Nodes: {', '.join(f'{nt}={data[nt].x.shape[0]}' for nt in data.node_types)}")
     log.info(f"  Edge types: {len(data.edge_types)}")
 
-    # ── Load and filter decklists ──
-    decklists = pd.read_parquet(DECKLISTS_PARQUET)
+    # ── Load and filter decklists from all format subdirs ──
+    mode = overrides.get("mode", "pretrain")
+    format_filter = overrides.get("format_filter", None)
+
+    _dl_base = _cfg.DECKLISTS_PARQUET
+
+    dl_frames = []
+    for fmt in ACTIVE_FORMATS:
+        dl_path = format_path(_dl_base, fmt)
+        if dl_path.exists():
+            df = pd.read_parquet(dl_path)
+            if "format" not in df.columns:
+                df["format"] = fmt
+            # Prefix archetype names to match graph node names
+            df["archetype"] = fmt + "::" + df["archetype"]
+            dl_frames.append(df)
+    decklists = pd.concat(dl_frames, ignore_index=True) if dl_frames else pd.DataFrame()
+
+    # In finetune mode, filter to target format only
+    if mode == "finetune" and format_filter:
+        prefix = format_filter + "::"
+        before = len(decklists)
+        decklists = decklists[decklists["archetype"].str.startswith(prefix)]
+        log.info(f"  Finetune filter: {format_filter} → {len(decklists)}/{before} rows")
+
     log.info(f"\nFiltering decklists to last {hp['recency_days']} days...")
     decklists = _filter_recent_decklists(decklists, hp["recency_days"])
 
     # ── Build ground truth ──
     log.info("\nBuilding ground truth (raw integer counts)...")
     ground_truth = _build_ground_truth(data, decklists)
+
+    # ── Identify deck vs negative cards for curriculum sampling ──
+    n_total_cards = data["card"].x.shape[0]
+    deck_card_set, negative_cards = _identify_deck_and_negative_cards(
+        ground_truth, n_total_cards,
+    )
+    log.info(f"  Curriculum pool: {len(deck_card_set)} deck cards, "
+             f"{len(negative_cards)} negative cards "
+             f"(start={hp['curriculum_neg_start']}, "
+             f"epochs={hp['curriculum_neg_epochs']}, "
+             f"schedule={hp['curriculum_neg_schedule']})")
+
+    # ── Filter to top N archetypes per format if requested ──
+    # Graph retains all archetypes; this only limits which ones we train on.
+    top_n = hp["top_n_archetypes"]
+    if top_n > 0:
+        arch_names_pre = data["archetype"].names
+        # Load metagame data to rank by meta share
+        top_arch_names: set[str] = set()
+        for fmt in ACTIVE_FORMATS:
+            meta_path = format_path(METAGAME_PARQUET, fmt)
+            if not meta_path.exists():
+                continue
+            meta = pd.read_parquet(meta_path)
+            latest = (
+                meta.sort_values("snapshot_date")
+                .groupby("archetype").last().reset_index()
+            )
+            latest = latest.dropna(subset=["meta_share_pct"])
+            top_fmt = latest.nlargest(top_n, "meta_share_pct")
+            # Prefix to match graph node names
+            top_arch_names |= {fmt + "::" + a for a in top_fmt["archetype"]}
+
+        # Filter ground_truth to only top N archetypes
+        before = len(ground_truth)
+        ground_truth = {
+            a_idx: gt for a_idx, gt in ground_truth.items()
+            if arch_names_pre[a_idx] in top_arch_names
+        }
+        log.info(f"  Top-{top_n} filter: {len(ground_truth)}/{before} archetypes kept for training")
+    else:
+        log.info(f"  Training on all {len(ground_truth)} archetypes with ground truth")
 
     # ── Move to device ──
     data = data.to(device)
@@ -474,19 +797,48 @@ def train_deck(device=None, trial=None, **overrides):
             d_message=hp["d_message"],
             d_count=hp["d_count"],
             num_gnn_layers=hp["num_gnn_layers"],
-            num_attn_heads=hp["num_attn_heads"],
             dropout=hp["dropout"],
+            edge_chunk_size=hp["edge_chunk_size"],
         ).to(device)
+
+        # Load pretrained weights for finetune mode
+        pretrained_path = overrides.get("pretrained_path", None)
+        if mode == "finetune" and pretrained_path and fold_i == 0:
+            log.info(f"Loading pretrained weights from {pretrained_path}")
+            ckpt = torch.load(pretrained_path, weights_only=False)
+            model.load_state_dict(ckpt["model_state_dict"], strict=False)
 
         if fold_i == 0:
             total_params = sum(p.numel() for p in model.parameters())
             log.info(f"Model parameters: {total_params:,}")
 
+        # Differential learning rates: GNN backbone gets scaled LR
+        gnn_params = list(model.gnn.parameters())
+        gnn_param_ids = {id(p) for p in gnn_params}
+        decoder_params = [p for p in model.parameters() if id(p) not in gnn_param_ids]
+
+        base_lr = hp["learning_rate"]
+        if mode == "finetune":
+            base_lr *= TRANSFER_FINETUNE_LR_SCALE
+        gnn_lr = base_lr * hp["gnn_lr_scale"]
+
+        # In finetune mode, optionally freeze GNN for first N epochs
+        gnn_freeze_epochs = TRANSFER_GNN_FREEZE_EPOCHS if mode == "finetune" else 0
+        if gnn_freeze_epochs > 0 and fold_i == 0:
+            log.info(f"  Freezing GNN for first {gnn_freeze_epochs} epochs (finetune)")
+            for p in gnn_params:
+                p.requires_grad = False
+
         optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=hp["learning_rate"],
+            [
+                {"params": gnn_params, "lr": gnn_lr},
+                {"params": decoder_params, "lr": base_lr},
+            ],
             weight_decay=hp["weight_decay"],
         )
+        if fold_i == 0:
+            log.info(f"LR: GNN={gnn_lr:.1e} (scale={hp['gnn_lr_scale']}), Decoder={base_lr:.1e}"
+                     f"{' [finetune]' if mode == 'finetune' else ''}")
 
         # ── LR scheduler ──
         warmup_epochs = hp["warmup_epochs"]
@@ -512,17 +864,22 @@ def train_deck(device=None, trial=None, **overrides):
         else:
             scheduler = base_sched
 
-        # ── Mixed precision & torch.compile ──
+        # ── Mixed precision ──
         use_amp = device.type == "cuda"
         scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
-        if device.type == "cuda" and hasattr(torch, "compile"):
-            try:
-                model.gnn = torch.compile(model.gnn, mode="reduce-overhead")
-                if fold_i == 0:
-                    log.info("  torch.compile() applied to GNN")
-            except Exception as e:
-                log.warning(f"  torch.compile() failed, continuing without: {e}")
+        # NOTE: torch.compile with mode="reduce-overhead" uses CUDA Graphs
+        # which pre-allocate massive GPU memory pools (~60+ GB) that cannot
+        # be freed between folds or sweep trials. Disabled to avoid OOM.
+        # If you want to enable it for single-run training (not sweeps),
+        # uncomment the block below.
+        # if device.type == "cuda" and hasattr(torch, "compile") and trial is None:
+        #     try:
+        #         model.gnn = torch.compile(model.gnn, mode="reduce-overhead")
+        #         if fold_i == 0:
+        #             log.info("  torch.compile() applied to GNN")
+        #     except Exception as e:
+        #         log.warning(f"  torch.compile() failed, continuing without: {e}")
 
         # ── Training loop ──
         best_val_metric = -1.0
@@ -536,6 +893,18 @@ def train_deck(device=None, trial=None, **overrides):
         eff_batch = hp["batch_size"] if hp["batch_size"] > 0 else len(train_archs)
         val_every = hp["val_every"]
 
+        # Color-balanced batching setup
+        color_groups = None
+        if hp["batch_strategy"] == "color_balanced" and eff_batch < len(train_archs):
+            color_groups = _get_archetype_color_groups(data, train_archs)
+            if fold_i == 0:
+                log.info(f"  Color-balanced batching: {', '.join(f'{c}={len(v)}' for c, v in color_groups.items())}")
+
+        # Inverse color-frequency loss weighting
+        color_weights: dict[int, float] = {}
+        if hp["color_loss_weighting"]:
+            color_weights = _compute_color_loss_weights(data, train_archs)
+
         log.info(f"\n{'Epoch':>5} {'Loss':>8} {'SelL':>8} {'CntL':>8} "
                  f"{'Prec':>8} {'Rec':>8} {'Jacc':>8} "
                  f"{'ExCnt':>8} {'MAE':>8} {'LR':>10}")
@@ -544,79 +913,141 @@ def train_deck(device=None, trial=None, **overrides):
         for epoch in range(1, hp["num_epochs"] + 1):
             model.train()
 
+            # Curriculum mask: restrict decoder's candidate pool early, grow to full
+            curriculum_mask = _compute_curriculum_mask(
+                epoch=epoch,
+                deck_card_set=deck_card_set,
+                negative_cards=negative_cards,
+                total_cards=n_total_cards,
+                neg_start=hp["curriculum_neg_start"],
+                neg_epochs=hp["curriculum_neg_epochs"],
+                schedule=hp["curriculum_neg_schedule"],
+            ).to(device)
+            n_eligible = int(curriculum_mask.sum().item())
+            if epoch == 1 or epoch == hp["curriculum_neg_epochs"]:
+                log.info(f"  Epoch {epoch}: curriculum pool = {n_eligible}/{n_total_cards} cards")
+
+            # Unfreeze GNN after freeze period in finetune mode
+            if gnn_freeze_epochs > 0 and epoch == gnn_freeze_epochs + 1:
+                log.info(f"  Unfreezing GNN at epoch {epoch}")
+                for p in gnn_params:
+                    p.requires_grad = True
+
             epoch_loss = 0.0
             epoch_select_loss = 0.0
             epoch_count_loss = 0.0
             epoch_correct = 0
             epoch_steps = 0
 
-            # Shuffle archetypes for stochastic batching (only those with GT)
+            # Build batches (only archetypes with ground truth)
             epoch_archs = [a for a in train_archs if ground_truth.get(a)]
-            random.shuffle(epoch_archs)
-            n_archs = len(epoch_archs)
 
-            # Process archetypes in batches
-            optimizer.zero_grad()
-            batch_count = 0
+            if color_groups is not None:
+                # Color-balanced batching: greedy color coverage per batch
+                batches = _color_balanced_batches(
+                    color_groups, eff_batch, epoch_archs, epoch,
+                )
+            else:
+                # Random batching (default)
+                random.shuffle(epoch_archs)
+                batches = [epoch_archs[i:i + eff_batch]
+                           for i in range(0, len(epoch_archs), eff_batch)]
 
-            # Cache GNN embeddings (recomputed after each optimizer step).
-            # Multiple backward() calls through the same cached x_dict require
-            # retain_graph=True on all but the last call in each batch.
-            with torch.amp.autocast("cuda", enabled=use_amp):
-                x_dict = model.gnn(data)
+            n_archs = sum(len(b) for b in batches)
 
-            for arch_i, a_idx in enumerate(epoch_archs):
-                gt = ground_truth[a_idx]
+            # Process archetypes in batches using detached GNN embeddings.
+            #
+            # Memory optimization: instead of keeping the GNN computation
+            # graph alive across all archetype backward passes (via
+            # retain_graph=True), we:
+            #   1. Run GNN forward → get x_dict (with grad graph)
+            #   2. Detach x_dict into leaf tensors that collect decoder grads
+            #   3. Run decoder forward+backward for batch archetypes
+            #      (no retain_graph needed — decoder graph is independent)
+            #   4. Backprop accumulated decoder grads through GNN
+            #   5. Optimizer step
+            #
+            # This frees GNN activations before the decoder runs, cutting
+            # peak memory from ~128 GB to ~51 GB with gradient checkpointing.
 
+            for batch_archs in batches:
+                batch_size = len(batch_archs)
+
+                optimizer.zero_grad()
+
+                # Step 1: GNN forward (builds computation graph)
+                if device.type == "cuda" and epoch == 1 and batch_archs is batches[0]:
+                    torch.cuda.reset_peak_memory_stats()
+                    log.info(f"  GPU before GNN: {torch.cuda.memory_allocated()/1e9:.1f} GB")
                 with torch.amp.autocast("cuda", enabled=use_amp):
-                    result = model.forward_with_embeddings(
-                        x_dict, a_idx, greedy=False, target_deck=gt,
-                    )
-                    loss, metrics = compute_step_losses(
-                        result["steps"], gt, hp["count_loss_weight"],
-                    )
+                    x_dict = model.gnn(data)
+                if device.type == "cuda" and epoch == 1 and batch_archs is batches[0]:
+                    log.info(f"  GPU after GNN:  {torch.cuda.memory_allocated()/1e9:.1f} GB "
+                             f"(peak: {torch.cuda.max_memory_allocated()/1e9:.1f} GB) "
+                             f"ckpt={model.gnn.gradient_checkpointing}")
 
-                # Determine if this is the last backward through the current
-                # GNN graph: either the batch is about to be full, or we've
-                # reached the last archetype in the epoch.
-                batch_count += 1
-                is_last_in_batch = (batch_count >= eff_batch) or (arch_i == n_archs - 1)
+                # Step 2: Detach — x_dict_d are leaf tensors that collect
+                # decoder gradients without keeping the GNN graph alive
+                x_dict_d = {
+                    nt: x_dict[nt].detach().requires_grad_(True)
+                    for nt in x_dict
+                }
 
-                # Scale loss by effective batch size for consistent gradient magnitude.
-                # retain_graph=True keeps the GNN computation graph alive for
-                # subsequent archetypes sharing the same cached x_dict.
-                scaler.scale(loss / eff_batch).backward(retain_graph=not is_last_in_batch)
+                # Step 3: Decoder forward + backward for each archetype
+                for a_idx in batch_archs:
+                    gt = ground_truth[a_idx]
 
-                epoch_loss += metrics["total_loss"]
-                epoch_select_loss += metrics["select_loss"]
-                epoch_count_loss += metrics["count_loss"]
-                epoch_correct += metrics["correct_cards"]
-                epoch_steps += metrics["total_steps"]
+                    with torch.amp.autocast("cuda", enabled=use_amp):
+                        result = model.forward_with_embeddings(
+                            x_dict_d, a_idx, greedy=False, target_deck=gt,
+                            curriculum_mask=curriculum_mask,
+                        )
+                        loss, metrics = compute_step_losses(
+                            result["steps"], gt, hp["count_loss_weight"],
+                        )
 
-                # Step when batch is full
-                if batch_count >= eff_batch:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    scaler.step(optimizer)
-                    scaler.update()
-                    optimizer.zero_grad()
-                    batch_count = 0
-                    # Recompute GNN embeddings since weights changed
-                    if arch_i < n_archs - 1:
-                        with torch.amp.autocast("cuda", enabled=use_amp):
-                            x_dict = model.gnn(data)
+                    # Decoder backward — grads accumulate in x_dict_d[nt].grad
+                    # and in decoder parameters. No retain_graph needed.
+                    arch_weight = color_weights.get(a_idx, 1.0)
+                    scaler.scale(loss * arch_weight / batch_size).backward()
 
-            # Handle final partial batch
-            if batch_count > 0:
+                    epoch_loss += metrics["total_loss"]
+                    epoch_select_loss += metrics["select_loss"]
+                    epoch_count_loss += metrics["count_loss"]
+                    epoch_correct += metrics["correct_cards"]
+                    epoch_steps += metrics["total_steps"]
+
+                # Step 4: Backprop accumulated decoder grads through GNN.
+                # Extract gradients from x_dict_d, then free it and reclaim
+                # fragmented GPU memory before the GNN backward.  The GNN
+                # backward (with gradient checkpointing) must recompute the
+                # forward pass, which temporarily recreates large message
+                # tensors — freeing decoder state first gives it headroom.
+                gnn_tensors = []
+                gnn_grads = []
+                for nt in x_dict:
+                    gnn_tensors.append(x_dict[nt])
+                    grad = x_dict_d[nt].grad
+                    if grad is not None:
+                        gnn_grads.append(grad.clone())
+                    else:
+                        gnn_grads.append(torch.zeros_like(x_dict[nt]))
+                del x_dict_d
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+
+                torch.autograd.backward(gnn_tensors, grad_tensors=gnn_grads)
+                del gnn_grads
+
+                # Step 5: Optimizer step
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
-                optimizer.zero_grad()
 
             scheduler.step()
 
-            n_train = max(len(train_archs), 1)
+            n_train = max(n_archs, 1)  # accounts for oversampling in color_balanced mode
             train_losses.append({
                 "loss": epoch_loss / n_train,
                 "select_loss": epoch_select_loss / n_train,
@@ -726,11 +1157,20 @@ def train_deck(device=None, trial=None, **overrides):
     training_log = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "task": "autoregressive_deck_constructor",
+        "mode": mode,
+        "format_filter": format_filter,
         "architecture": "HeteroGNN + CrossAttention DeckConstructor",
         "hyperparameters": hp,
         "graph_info": {
             "node_types": {nt: data[nt].x.shape[0] for nt in data.node_types},
             "edge_types": len(data.edge_types),
+        },
+        "curriculum": {
+            "neg_start": hp["curriculum_neg_start"],
+            "neg_epochs": hp["curriculum_neg_epochs"],
+            "schedule": hp["curriculum_neg_schedule"],
+            "total_deck_cards": len(deck_card_set),
+            "total_negative_cards": len(negative_cards),
         },
         "fold_results": all_fold_results,
         "run_dir": str(run_dir),
@@ -786,8 +1226,8 @@ def evaluate_deck(result: dict):
             d_message=hp["d_message"],
             d_count=hp["d_count"],
             num_gnn_layers=hp["num_gnn_layers"],
-            num_attn_heads=hp["num_attn_heads"],
             dropout=hp["dropout"],
+            edge_chunk_size=hp.get("edge_chunk_size", 0),
         ).to(data["card"].x.device)
 
         checkpoint = torch.load(model_path, weights_only=False)
@@ -839,5 +1279,24 @@ def evaluate_deck(result: dict):
 
 
 if __name__ == "__main__":
-    result = train_deck()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Train MTG deck predictor")
+    parser.add_argument("--mode", choices=["pretrain", "finetune"], default="pretrain",
+                        help="pretrain: all formats; finetune: target format only")
+    parser.add_argument("--format-filter", type=str, default=None,
+                        help="Target format for finetune mode. Options: 'standard', 'pioneer'")
+    parser.add_argument("--pretrained-path", type=str, default=None,
+                        help="Path to pretrained model checkpoint for finetune mode")
+    args = parser.parse_args()
+
+    overrides = {
+        "mode": args.mode,
+        "format_filter": args.format_filter,
+        "pretrained_path": args.pretrained_path,
+    }
+    if args.mode == "finetune":
+        overrides["num_epochs"] = TRANSFER_FINETUNE_EPOCHS
+
+    result = train_deck(**overrides)
     evaluate_deck(result)

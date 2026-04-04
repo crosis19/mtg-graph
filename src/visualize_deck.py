@@ -50,7 +50,9 @@ def _get_deck_predictions(data, model) -> dict:
             arch_actual.setdefault(a_idx, {})[card] = count
 
     results = {}
+    n_archetypes = len(arch_names)
     for a_idx, arch_name in enumerate(arch_names):
+        log.info(f"  Predicting deck {a_idx + 1}/{n_archetypes}: {arch_name}")
         pred_raw = model.predict_deck(data, a_idx)
         actual = arch_actual.get(a_idx, {})
         actual_set = set(actual.keys())
@@ -286,7 +288,6 @@ def generate_deck_html(training_log: dict, deck_predictions: dict) -> str:
           <dt>Architecture</dt><dd>GNN + Autoregressive</dd>
           <dt>d_model</dt><dd>{hp.get('d_model', '?')}</dd>
           <dt>d_count</dt><dd>{hp.get('d_count', '?')}</dd>
-          <dt>Attn Heads</dt><dd>{hp.get('num_attn_heads', '?')}</dd>
           <dt>GNN Layers</dt><dd>{hp.get('num_gnn_layers', '?')}</dd>
           <dt>Dropout</dt><dd>{hp.get('dropout', '?')}</dd>
           <dt>LR</dt><dd>{hp.get('learning_rate', '?')}</dd>
@@ -424,16 +425,15 @@ def main(run_dir=None, fold_idx=0):
         d_message=hp.get("d_message", 128),
         d_count=hp.get("d_count", 16),
         num_gnn_layers=hp.get("num_gnn_layers", 2),
-        num_attn_heads=hp.get("num_attn_heads", 4),
         dropout=0.0,  # no dropout at inference
     )
 
     model.load_state_dict(checkpoint["model_state_dict"])
 
-    log.info("Getting deck predictions...")
+    log.info(f"Generating predictions for {len(data['archetype'].names)} archetypes...")
     deck_predictions = _get_deck_predictions(data, model)
 
-    log.info("Generating HTML dashboard...")
+    log.info("Building HTML dashboard...")
     html = generate_deck_html(training_log, deck_predictions)
 
     dashboard_path = run_dir / "dashboard.html"

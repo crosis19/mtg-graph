@@ -1,18 +1,22 @@
 # MTG Deck Composition Predictor
 
-A Heterogeneous Graph Transformer (HGT) that predicts which cards belong in which Magic: The Gathering Standard deck archetypes using BPR ranking loss and leave-one-out attention pooling.
+A two-stage GNN + autoregressive MLP system that predicts competitive 60-card Magic: The Gathering decklists given an archetype identity. Supports multiple formats (Standard, Pioneer) in a unified graph with transfer learning.
 
 ## Overview
 
-This project models the MTG Standard metagame as a heterogeneous graph with three node types and multiple edge types, then trains a GNN to rank cards by their likelihood of inclusion in each archetype's deck.
+This project models MTG competitive metagames as a heterogeneous graph with three node types (card, archetype, set) and 11 edge types, then trains an autoregressive deck constructor to build complete 60-card decklists one card at a time. Multiple formats share card nodes in a unified graph, enabling transfer learning from Pioneer to Standard.
 
 ### Key Features
 
-- **BPR ranking loss** — directly optimizes per-archetype card ranking instead of pointwise classification
-- **Leave-one-out attention pooling** — prevents information leakage during training by excluding the predicted card from the archetype's embedding
-- **Card-level train/val/test split** — tests generalization to unseen cards
+- **Multi-format support** — Standard and Pioneer archetypes in a unified graph with shared card embeddings and format-prefixed archetype nodes
+- **Transfer learning** — pre-train on all formats, fine-tune on Standard with GNN freezing and reduced learning rate
+- **Two-stage architecture** — HeteroGNN learns embeddings via message passing, then an MLP-scored autoregressive decoder constructs decks card-by-card
+- **Edge features with learnable edge-type weights** — graph edge weights (copy counts, synergy scores, win rates) are treated as input features to the MessageMLP, while learnable per-edge-type scalars control each relationship type's contribution
+- **Argmax selection with context correction** — same selection strategy at train and inference time, with teacher forcing to prevent error snowballing
+- **Separate count heads** — non-basic cards (1-4 copies) and basic lands (1-20 copies) use dedicated classification heads
+- **Archetype-holdout cross-validation** — tests generalization to unseen archetypes
 - **30-day recency filter** — uses only recent decklists from MTGGoldfish
-- **Early stopping on Hits@25** — checkpoints on the metric that matters
+- **Early stopping on Jaccard similarity** — checkpoints on the metric that matters
 
 ## Architecture
 
@@ -20,39 +24,38 @@ This project models the MTG Standard metagame as a heterogeneous graph with thre
 
 | Node Type | Count | Features |
 |-----------|-------|----------|
-| Card | ~4,168 | 384-dim semantic embedding + 11 numeric (cmc, colors, types, banned, etc.) |
-| Archetype | ~6 | 390-dim (meta share, colors, creature/spell ratios, avg cmc, mean card embedding) |
-| Set | ~16 | recency, size, avg cmc |
+| Card | ~4,168 (Standard) / ~8-10k (Standard+Pioneer) | 384-dim semantic embedding + 23 scalar features (cmc, colors, types, rarity, mana generation) |
+| Archetype | ~16 Standard + ~32 Pioneer (format-prefixed) | 16-dim (6 color flags + 8 type ratios + 2 format one-hot) |
+| Set | Dynamic (all sets with legal cards) | 385-dim (mean card embedding + recency score) |
 
 | Edge Type | Description |
 |-----------|-------------|
 | `(card, keyword_synergy, card)` | Complementary keywords (e.g., deathtouch + first strike) |
-| `(card, mechanical_synergy, card)` | Trigger/enabler patterns |
-| `(card, semantic_synergy, card)` | Oracle text embedding similarity |
-| `(archetype, maindecks, card)` | Mainboard inclusion (edge_attr: avg copies, inclusion rate) |
-| `(card, maindeck_of, archetype)` | Reverse |
-| `(archetype, sideboards, card)` | Sideboard inclusion (edge_attr: avg copies, inclusion rate) |
-| `(card, sideboard_of, archetype)` | Reverse |
-| `(archetype, counters, archetype)` | Favorable matchup (>55% win rate, directed) |
-| `(archetype, countered_by, archetype)` | Reverse |
+| `(card, semantic_synergy, card)` | Oracle text embedding similarity >= 0.65 |
+| `(card, counters/countered_by, card)` | Counterspell interactions (directed + reverse) |
+| `(card, removes/removed_by, card)` | Removal interactions (directed + reverse) |
 | `(set, printed_in, card)` | Set membership |
-| `(card, from_set, set)` | Reverse |
+| `(card, member_of, set)` | Reverse of printed_in |
+| `(archetype, contains, card)` | Archetype includes card (feature: copy count) |
+| `(card, in_deck, archetype)` | Reverse of contains |
+| `(archetype, win_rate, archetype)` | Head-to-head win rate |
+| `(archetype, lose_rate, archetype)` | Head-to-head loss rate |
 
 ### Model
 
-HGT card backbone + BPR ranking with leave-one-out attention pooling:
-- **Card embeddings**: HGT over synergy + set edges (cards don't see deck assignments)
-- **Archetype embeddings**: Attention-weighted pool over each deck's card embeddings; during training, the card being predicted is excluded (leave-one-out) to prevent information leakage
-- **Prediction head**: `concat(card_emb, arch_emb, card_emb * arch_emb)` → MLP → logit
-- **Training**: BPR loss with color-identity-aware hard negative sampling
-- **Metrics**: Hits@K, MRR, F1
+**Stage 1 (HeteroGNN):** MLP-based message passing with additive skip connections. Edge weights from the graph (copy counts, synergy scores, win rates) are concatenated as input features to edge-type-specific MessageMLPs. Learnable per-edge-type scalar weights control each relationship type's contribution.
+
+**Stage 2 (Autoregressive Deck Constructor):** Given archetype embeddings from the GNN, builds a 60-card deck one card at a time using MLP scoring over the card pool with separate count classification heads for non-basic cards (1-4) and basic lands (1-20).
+
+- **Training**: Argmax selection with context correction and count teacher forcing
+- **Metrics**: Jaccard similarity, precision, recall, exact count match
 
 ## Project Structure
 
 ```
 mtg-graph/
 ├── src/
-│   ├── config.py              # Paths, constants, hyperparameters (.env support)
+│   ├── config.py              # Paths, constants, format registry, hyperparameters
 │   ├── ingest_all.py          # CLI orchestrator for Phases 1-3 with validation
 │   ├── ingest_cards.py        # Phase 1: Download cards from Scryfall API
 │   ├── ingest_metagame.py     # Phase 1: Scrape metagame + decklists (MTGGoldfish)
@@ -61,16 +64,24 @@ mtg-graph/
 │   ├── keyword_matrix.py      # Phase 2: Keyword synergy edge extraction
 │   ├── card_embeddings.py     # Phase 2: Semantic embeddings (SentenceTransformer)
 │   ├── synergy_eval.py        # Phase 2: Synergy edge quality evaluation
-│   ├── graph_builder.py       # Phase 3: Assemble HeteroData graph
-│   ├── deck_predictor.py      # Phase 4: Deck composition predictor model
-│   ├── train_deck.py          # Phase 4: BPR training loop with early stopping
+│   ├── card_interaction_edges.py # Phase 2: Counter/removal edge extraction
+│   ├── graph_builder.py       # Phase 3: Assemble multi-format HeteroData graph
+│   ├── deck_predictor.py      # Phase 4: HeteroGNN + autoregressive deck constructor
+│   ├── train_deck.py          # Phase 4: Training loop with pretrain/finetune modes
 │   ├── visualize_deck.py      # Phase 5: Interactive HTML dashboard
 │   └── synthetic_data.py      # Generate synthetic data for development
 ├── data/                      # Generated by pipeline (not committed)
+│   ├── raw/                   #   Scryfall bulk JSON
+│   ├── processed/             #   Shared: cards.parquet, synergy edges, graph.pt
+│   │   ├── standard/          #   Standard: metagame, decklists, matchups
+│   │   └── pioneer/           #   Pioneer: metagame, decklists, matchups
+│   └── embeddings/            #   Card embeddings (shared)
 ├── results/
 │   └── deck/                  # Training runs (timestamped)
 ├── notebooks/
-│   └── train_deck_colab.ipynb # GPU training on Google Colab
+│   ├── train_deck_colab.ipynb # GPU training on Google Colab
+│   ├── sweep_deck_colab.ipynb # Optuna hyperparameter sweep
+│   └── inference_deck_colab.ipynb # Inference / deck generation
 ├── pyproject.toml
 ├── requirements.txt
 └── .env.example
@@ -109,24 +120,31 @@ cp .env.example .env
 ### Data Ingestion (Phases 1-3)
 
 ```bash
-python -m src.ingest_all                # Full pipeline (Phases 1-3)
-python -m src.ingest_all --phase 1      # Phase 1 only (scrape external data)
-python -m src.ingest_all --phase 2      # Phase 2 only (build synergy edges)
-python -m src.ingest_all --phase 3      # Phase 3 only (build graph)
-python -m src.ingest_all --skip-scrape  # Phases 2-3 (reuse existing scraped data)
-python -m src.ingest_all --validate-only # Check existing output files
+python -m src.ingest_all                      # Full pipeline, all formats
+python -m src.ingest_all --phase 1            # Phase 1 only (scrape)
+python -m src.ingest_all --phase 2            # Phase 2 only (synergy edges)
+python -m src.ingest_all --phase 3            # Phase 3 only (build graph)
+python -m src.ingest_all --format standard    # Single format only
+python -m src.ingest_all --skip-scrape        # Phases 2-3 (reuse scraped data)
+python -m src.ingest_all --validate-only      # Check existing output files
 ```
 
 ### Training (Phase 4)
 
 ```bash
-python -m src.train_deck
+# Pre-train on all formats (Standard + Pioneer)
+python -m src.train_deck --mode pretrain
+
+# Fine-tune on Standard using a pretrained checkpoint
+python -m src.train_deck --mode finetune \
+    --format-filter standard \
+    --pretrained-path results/deck/latest/model_fold0.pt
 
 # GPU training via Colab — see notebooks/train_deck_colab.ipynb
 ```
 
 Each training run saves to a timestamped folder under `results/deck/`:
-- `model.pt` — best model checkpoint
+- `model_fold*.pt` — best model checkpoint per fold
 - `training_log.json` — hyperparameters, epoch curves, final metrics
 - `dashboard.html` — interactive visualization
 
@@ -138,13 +156,22 @@ python -m src.visualize_deck
 
 ## Data Sources
 
-All data is downloaded or scraped by the pipeline — no data files are committed to the repo.
+All data is downloaded or scraped by the pipeline — no data files are committed to the repo. Per-format data (metagame, decklists, matchups) is stored in `data/processed/{format}/` subdirectories.
 
 | Source | Data | Module |
 |--------|------|--------|
-| [Scryfall API](https://scryfall.com/docs/api) | Card oracle text, attributes, set info | `ingest_cards.py` |
-| [MTGGoldfish](https://www.mtggoldfish.com/metagame/standard#paper) | Metagame share + archetype decklists (30-day paper) | `ingest_metagame.py` |
-| [MTGDecks](https://www.mtgdecks.net) | Archetype matchup win rates | `ingest_matchups.py` |
+| [Scryfall API](https://scryfall.com/docs/api) | Card oracle text, attributes, set info (shared across formats) | `ingest_cards.py` |
+| [MTGGoldfish](https://www.mtggoldfish.com/metagame/) | Metagame share + archetype decklists per format (30-day paper) | `ingest_metagame.py` |
+| [MTGDecks](https://www.mtgdecks.net) | Archetype matchup win rates per format | `ingest_matchups.py` |
+
+### Active Formats
+
+Configured via `ACTIVE_FORMATS` in `config.py` or `ACTIVE_FORMATS` env var (comma-separated):
+
+| Format | Cards | Archetypes | MTGGoldfish Path | MTGDecks Path |
+|--------|-------|------------|------------------|---------------|
+| Standard | ~4,168 | 16 | `/metagame/standard` | `/Standard/winrates/` |
+| Pioneer | ~8-10k | 32 | `/metagame/pioneer` | `/Pioneer/winrates/` |
 
 ## License
 

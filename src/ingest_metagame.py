@@ -32,14 +32,14 @@ from src.config import (
     DECKLISTS_PARQUET,
     METAGAME_PARQUET,
     SCRAPE_DELAY,
+    SUPPORTED_FORMATS,
+    format_path,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 GOLDFISH_BASE = "https://www.mtggoldfish.com"
-# Use the standard page (not /full) — defaults to 30-day view with top archetypes
-METAGAME_URL = f"{GOLDFISH_BASE}/metagame/standard"
 
 HEADERS = {
     "User-Agent": "MTG-Graph-Research/1.0 (academic project; respectful scraping)",
@@ -81,8 +81,8 @@ def _fetch(url: str) -> BeautifulSoup:
 # ── Metagame page scraper ───────────────────────────────────────────────
 
 
-def scrape_current_metagame() -> list[dict]:
-    """Scrape the current Standard metagame page from MTGGoldfish.
+def scrape_current_metagame(format_name: str = "standard") -> list[dict]:
+    """Scrape the current metagame page from MTGGoldfish for a given format.
 
     Parses .archetype-tile elements from the 30-day default view.
     Extracts archetype names from .archetype-tile-title (not the card image
@@ -91,8 +91,10 @@ def scrape_current_metagame() -> list[dict]:
     Returns list of dicts with archetype name, meta share, deck count,
     color identity, and archetype page URL.
     """
-    log.info("Fetching metagame from %s", METAGAME_URL)
-    soup = _fetch(METAGAME_URL)
+    fmt_cfg = SUPPORTED_FORMATS[format_name]
+    metagame_url = GOLDFISH_BASE + fmt_cfg["goldfish_path"]
+    log.info("Fetching %s metagame from %s", format_name, metagame_url)
+    soup = _fetch(metagame_url)
 
     snapshot_date = datetime.now().strftime("%Y-%m-%d")
     archetypes = []
@@ -151,6 +153,7 @@ def scrape_current_metagame() -> list[dict]:
             "color_identity": infer_color_identity(name),
             "archetype_url": archetype_url,
             "source": "mtggoldfish",
+            "format": format_name,
         })
 
     log.info("Parsed %d unique archetypes from metagame page.", len(archetypes))
@@ -327,24 +330,30 @@ def _download_text_decklist(soup: BeautifulSoup) -> list[dict]:
 # ── Main pipeline ───────────────────────────────────────────────────────
 
 
-def run() -> pd.DataFrame:
+def run(format_name: str = "standard") -> pd.DataFrame:
     """Full pipeline: scrape metagame + decklists for eligible archetypes."""
-    DATA_PROCESSED.mkdir(parents=True, exist_ok=True)
+    fmt_cfg = SUPPORTED_FORMATS[format_name]
+    num_archetypes = fmt_cfg["num_archetypes"]
+
+    # Use format-namespaced paths
+    meta_path = format_path(METAGAME_PARQUET, format_name)
+    dl_path = format_path(DECKLISTS_PARQUET, format_name)
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Step 1: Scrape metagame overview
-    snapshots = scrape_current_metagame()
+    snapshots = scrape_current_metagame(format_name)
     meta_df = pd.DataFrame(snapshots)
 
     # Append to existing data if available
-    if METAGAME_PARQUET.exists():
-        existing = pd.read_parquet(METAGAME_PARQUET)
+    if meta_path.exists():
+        existing = pd.read_parquet(meta_path)
         meta_df = pd.concat([existing, meta_df], ignore_index=True)
         meta_df = meta_df.drop_duplicates(subset=["snapshot_date", "archetype"], keep="last")
 
-    meta_df.to_parquet(METAGAME_PARQUET, index=False)
-    log.info("Saved %d metagame rows to %s", len(meta_df), METAGAME_PARQUET)
+    meta_df.to_parquet(meta_path, index=False)
+    log.info("Saved %d %s metagame rows to %s", len(meta_df), format_name, meta_path)
 
-    # Step 2: Select top N archetypes by meta share (no minimum threshold)
+    # Step 2: Select archetypes by meta share (0 = all available)
     latest = (
         meta_df.sort_values("snapshot_date")
         .groupby("archetype")
@@ -352,8 +361,11 @@ def run() -> pd.DataFrame:
         .reset_index()
     )
     latest = latest.dropna(subset=["meta_share_pct"])
-    eligible = latest.nlargest(DECK_NUM_ARCHETYPES, "meta_share_pct")
-    log.info("\nTop %d archetypes by meta share:", len(eligible))
+    if num_archetypes > 0:
+        eligible = latest.nlargest(num_archetypes, "meta_share_pct")
+    else:
+        eligible = latest.sort_values("meta_share_pct", ascending=False)
+    log.info("\n%d %s archetypes by meta share:", len(eligible), format_name)
     for _, row in eligible.sort_values("meta_share_pct", ascending=False).iterrows():
         log.info("  %5.1f%%  %s", row["meta_share_pct"], row["archetype"])
 
@@ -361,9 +373,9 @@ def run() -> pd.DataFrame:
         log.warning("No archetypes found!")
         empty_dl = pd.DataFrame(columns=[
             "archetype", "card_name", "avg_copies", "inclusion_pct",
-            "board", "snapshot_date",
+            "board", "snapshot_date", "format",
         ])
-        empty_dl.to_parquet(DECKLISTS_PARQUET, index=False)
+        empty_dl.to_parquet(dl_path, index=False)
         return meta_df
 
     # Step 3: Scrape Card Breakdown for each eligible archetype
@@ -392,13 +404,14 @@ def run() -> pd.DataFrame:
                 "inclusion_pct": card["inclusion_pct"],
                 "board": card["board"],
                 "snapshot_date": snapshot_date,
+                "format": format_name,
             })
 
     dl_df = pd.DataFrame(decklist_records)
 
     # Append to existing if available
-    if DECKLISTS_PARQUET.exists():
-        existing_dl = pd.read_parquet(DECKLISTS_PARQUET)
+    if dl_path.exists():
+        existing_dl = pd.read_parquet(dl_path)
         if set(dl_df.columns) == set(existing_dl.columns):
             dl_df = pd.concat([existing_dl, dl_df], ignore_index=True)
             dl_df = dl_df.drop_duplicates(
@@ -406,8 +419,8 @@ def run() -> pd.DataFrame:
                 keep="last",
             )
 
-    dl_df.to_parquet(DECKLISTS_PARQUET, index=False)
-    log.info("\nSaved %d decklist rows to %s", len(dl_df), DECKLISTS_PARQUET)
+    dl_df.to_parquet(dl_path, index=False)
+    log.info("\nSaved %d %s decklist rows to %s", len(dl_df), format_name, dl_path)
 
     # Summary
     if not dl_df.empty:

@@ -4,11 +4,12 @@ Runs each pipeline step sequentially and prints a validation report after
 each one so you can inspect the data before training.
 
 Usage:
-    python -m src.ingest_all              # Full pipeline (Phases 1-3)
-    python -m src.ingest_all --phase 1    # Phase 1 only (scrape data)
-    python -m src.ingest_all --phase 2    # Phase 2 only (synergy edges)
-    python -m src.ingest_all --phase 3    # Phase 3 only (build graph)
-    python -m src.ingest_all --skip-scrape # Phases 2-3 only (reuse existing data)
+    python -m src.ingest_all                      # Full pipeline (Phases 1-3)
+    python -m src.ingest_all --phase 1            # Phase 1 only (scrape data)
+    python -m src.ingest_all --phase 2            # Phase 2 only (synergy edges)
+    python -m src.ingest_all --phase 3            # Phase 3 only (build graph)
+    python -m src.ingest_all --skip-scrape        # Phases 2-3 only
+    python -m src.ingest_all --format standard    # Single format only
 """
 
 import argparse
@@ -20,6 +21,7 @@ from pathlib import Path
 import pandas as pd
 
 from src.config import (
+    ACTIVE_FORMATS,
     CARDS_PARQUET,
     CARD_EMBEDDINGS_PATH,
     COUNTER_EDGES_PATH,
@@ -30,6 +32,7 @@ from src.config import (
     METAGAME_PARQUET,
     REMOVAL_EDGES_PATH,
     SEMANTIC_EDGES_PATH,
+    format_path,
 )
 
 logging.basicConfig(
@@ -176,60 +179,65 @@ def _validate_graph():
 # ── Pipeline steps ──────────────────────────────────────────────────────
 
 
-def run_phase1():
-    """Phase 1: Scrape all external data sources."""
+def run_phase1(formats: list[str] | None = None):
+    """Phase 1: Scrape all external data sources for all active formats."""
+    if formats is None:
+        formats = ACTIVE_FORMATS
+
     log.info("")
     log.info("=" * 70)
-    log.info("PHASE 1: Data Ingestion")
+    log.info("PHASE 1: Data Ingestion (formats: %s)", formats)
     log.info("=" * 70)
 
-    # Step 1: Cards
+    # Step 1: Cards (shared — union of all format legalities)
     log.info("\n── Step 1/3: Scryfall Cards ──")
     from src.ingest_cards import run as ingest_cards
 
-    ingest_cards()
+    ingest_cards(formats=formats)
     cards_df = _validate_parquet(CARDS_PARQUET, "cards", ["name", "type_line"])
     _validate_cards(cards_df)
 
-    # Step 2: Metagame + Decklists (MTGGoldfish)
-    log.info("\n── Step 2/3: MTGGoldfish Metagame + Decklists ──")
+    # Step 2 & 3: Metagame + Matchups — once per format
     from src.ingest_metagame import run as ingest_metagame
-
-    ingest_metagame()
-    meta_df = _validate_parquet(METAGAME_PARQUET, "metagame", ["archetype", "meta_share_pct"])
-    _validate_metagame(meta_df)
-    d_df = _validate_parquet(DECKLISTS_PARQUET, "decklists", ["archetype", "card_name", "board"])
-    if d_df is not None and not d_df.empty:
-        log.info(f"    Unique archetypes in decklists: {d_df['archetype'].nunique()}")
-        log.info(f"    Unique cards in decklists: {d_df['card_name'].nunique()}")
-
-    # Step 3: Matchups (MTGDecks)
-    log.info("\n── Step 3/3: Archetype Matchups ──")
     from src.ingest_matchups import run as ingest_matchups
 
-    ingest_matchups()
-    matchup_df = _validate_parquet(MATCHUPS_PARQUET, "matchups", ["archetype_a", "archetype_b"])
-    _validate_matchups(matchup_df)
+    for fmt in formats:
+        log.info("\n── Step 2/3: MTGGoldfish Metagame + Decklists [%s] ──", fmt)
+        ingest_metagame(format_name=fmt)
+        meta_path = format_path(METAGAME_PARQUET, fmt)
+        dl_path = format_path(DECKLISTS_PARQUET, fmt)
+        meta_df = _validate_parquet(meta_path, f"metagame ({fmt})", ["archetype", "meta_share_pct"])
+        _validate_metagame(meta_df)
+        d_df = _validate_parquet(dl_path, f"decklists ({fmt})", ["archetype", "card_name", "board"])
+        if d_df is not None and not d_df.empty:
+            log.info(f"    Unique archetypes in decklists: {d_df['archetype'].nunique()}")
+            log.info(f"    Unique cards in decklists: {d_df['card_name'].nunique()}")
 
-    # Cross-validation: archetype name consistency
-    log.info("\n── Cross-Validation ──")
-    arch_sources = {}
-    if d_df is not None and not d_df.empty:
-        arch_sources["decklists"] = set(d_df["archetype"].unique())
-    if meta_df is not None and not meta_df.empty:
-        arch_sources["metagame"] = set(meta_df["archetype"].unique())
-    if matchup_df is not None and not matchup_df.empty:
-        arch_sources["matchups"] = (
-            set(matchup_df["archetype_a"].unique()) | set(matchup_df["archetype_b"].unique())
-        )
+        log.info("\n── Step 3/3: Archetype Matchups [%s] ──", fmt)
+        ingest_matchups(format_name=fmt)
+        matchup_path = format_path(MATCHUPS_PARQUET, fmt)
+        matchup_df = _validate_parquet(matchup_path, f"matchups ({fmt})", ["archetype_a", "archetype_b"])
+        _validate_matchups(matchup_df)
 
-    if len(arch_sources) >= 2:
-        all_archs = set()
-        for archs in arch_sources.values():
-            all_archs |= archs
-        log.info(f"  Total unique archetypes across sources: {len(all_archs)}")
-        for src_name, archs in arch_sources.items():
-            log.info(f"    {src_name}: {len(archs)} archetypes")
+        # Cross-validation: archetype name consistency within format
+        log.info("\n── Cross-Validation [%s] ──", fmt)
+        arch_sources = {}
+        if d_df is not None and not d_df.empty:
+            arch_sources["decklists"] = set(d_df["archetype"].unique())
+        if meta_df is not None and not meta_df.empty:
+            arch_sources["metagame"] = set(meta_df["archetype"].unique())
+        if matchup_df is not None and not matchup_df.empty:
+            arch_sources["matchups"] = (
+                set(matchup_df["archetype_a"].unique()) | set(matchup_df["archetype_b"].unique())
+            )
+
+        if len(arch_sources) >= 2:
+            all_archs = set()
+            for archs in arch_sources.values():
+                all_archs |= archs
+            log.info(f"  Total unique archetypes across sources: {len(all_archs)}")
+            for src_name, archs in arch_sources.items():
+                log.info(f"    {src_name}: {len(archs)} archetypes")
 
 
 def _validate_interaction_edges(path, name):
@@ -303,8 +311,11 @@ def run_phase3():
         sys.exit(1)
 
 
-def print_summary():
+def print_summary(formats: list[str] | None = None):
     """Print a final summary of all output files."""
+    if formats is None:
+        formats = ACTIVE_FORMATS
+
     log.info("")
     log.info("=" * 70)
     log.info("PIPELINE SUMMARY")
@@ -312,15 +323,23 @@ def print_summary():
 
     outputs = [
         ("Cards", CARDS_PARQUET),
-        ("Metagame", METAGAME_PARQUET),
-        ("Decklists", DECKLISTS_PARQUET),
-        ("Matchups", MATCHUPS_PARQUET),
+    ]
+
+    # Per-format outputs
+    for fmt in formats:
+        outputs.extend([
+            (f"Metagame ({fmt})", format_path(METAGAME_PARQUET, fmt)),
+            (f"Decklists ({fmt})", format_path(DECKLISTS_PARQUET, fmt)),
+            (f"Matchups ({fmt})", format_path(MATCHUPS_PARQUET, fmt)),
+        ])
+
+    outputs.extend([
         ("Keyword Synergy", KEYWORD_MATRIX_PATH),
         ("Semantic Synergy", SEMANTIC_EDGES_PATH),
         ("Counter Edges", COUNTER_EDGES_PATH),
         ("Removal Edges", REMOVAL_EDGES_PATH),
         ("Graph", GRAPH_PATH),
-    ]
+    ])
 
     for name, path in outputs:
         if path.exists():
@@ -356,11 +375,19 @@ def main():
         help="Skip Phase 1 (use existing scraped data)",
     )
     parser.add_argument(
+        "--format",
+        type=str,
+        help="Run only for a specific format (e.g., standard, pioneer)",
+    )
+    parser.add_argument(
         "--validate-only",
         action="store_true",
         help="Don't run any steps, just validate existing output files",
     )
     args = parser.parse_args()
+
+    # Determine which formats to process
+    formats = [args.format] if args.format else ACTIVE_FORMATS
 
     start = time.time()
 
@@ -369,11 +396,21 @@ def main():
         log.info("\n── Phase 1 Outputs ──")
         cards = _validate_parquet(CARDS_PARQUET, "cards", ["name", "type_line"])
         _validate_cards(cards)
-        meta = _validate_parquet(METAGAME_PARQUET, "metagame", ["archetype", "meta_share_pct"])
-        _validate_metagame(meta)
-        d_df = _validate_parquet(DECKLISTS_PARQUET, "decklists", ["archetype", "card_name", "board"])
-        matchups = _validate_parquet(MATCHUPS_PARQUET, "matchups", ["archetype_a", "archetype_b"])
-        _validate_matchups(matchups)
+        for fmt in formats:
+            meta = _validate_parquet(
+                format_path(METAGAME_PARQUET, fmt),
+                f"metagame ({fmt})", ["archetype", "meta_share_pct"],
+            )
+            _validate_metagame(meta)
+            _validate_parquet(
+                format_path(DECKLISTS_PARQUET, fmt),
+                f"decklists ({fmt})", ["archetype", "card_name", "board"],
+            )
+            matchups = _validate_parquet(
+                format_path(MATCHUPS_PARQUET, fmt),
+                f"matchups ({fmt})", ["archetype_a", "archetype_b"],
+            )
+            _validate_matchups(matchups)
         log.info("\n── Phase 2 Outputs ──")
         _validate_synergy_edges(KEYWORD_MATRIX_PATH, "keyword_synergy")
         _validate_synergy_edges(SEMANTIC_EDGES_PATH, "semantic_synergy")
@@ -381,25 +418,25 @@ def main():
         _validate_interaction_edges(REMOVAL_EDGES_PATH, "removal_edges")
         log.info("\n── Phase 3 Outputs ──")
         _validate_graph()
-        print_summary()
+        print_summary(formats)
     elif args.phase == 1:
-        run_phase1()
-        print_summary()
+        run_phase1(formats)
+        print_summary(formats)
     elif args.phase == 2:
         run_phase2()
-        print_summary()
+        print_summary(formats)
     elif args.phase == 3:
         run_phase3()
-        print_summary()
+        print_summary(formats)
     elif args.skip_scrape:
         run_phase2()
         run_phase3()
-        print_summary()
+        print_summary(formats)
     else:
-        run_phase1()
+        run_phase1(formats)
         run_phase2()
         run_phase3()
-        print_summary()
+        print_summary(formats)
 
     elapsed = time.time() - start
     log.info(f"\nTotal time: {elapsed:.1f}s")

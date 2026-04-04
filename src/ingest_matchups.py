@@ -21,7 +21,10 @@ except ImportError:
 
 import requests
 
-from src.config import MATCHUPS_PARQUET, DATA_PROCESSED, SCRAPE_DELAY, MTGDECKS_WINRATES_URL
+from src.config import (
+    MATCHUPS_PARQUET, DATA_PROCESSED, SCRAPE_DELAY, MTGDECKS_WINRATES_URL,
+    SUPPORTED_FORMATS, format_path,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -36,41 +39,66 @@ HEADERS = {
 }
 
 
-def scrape_mtgdecks_matchups() -> list[dict]:
-    """Scrape head-to-head matchup data from MTGDecks.net.
+MAX_RETRIES = 3
+RETRY_BACKOFF = [5, 15, 30]  # seconds to wait between retries
+
+
+def scrape_mtgdecks_matchups(format_name: str = "standard") -> list[dict]:
+    """Scrape head-to-head matchup data from MTGDecks.net for a given format.
+
+    Retries up to MAX_RETRIES times with exponential backoff if Cloudflare
+    blocks the request or the page doesn't contain the expected table.
 
     Returns list of dicts with columns:
         archetype_a, archetype_b, win_rate_a, win_rate_b,
-        sample_size, snapshot_date, source
+        sample_size, snapshot_date, source, format
     Win rates are stored as percentages (0-100).
     """
-    log.info("Fetching matchup data from %s", MTGDECKS_WINRATES_URL)
+    url = SUPPORTED_FORMATS[format_name]["mtgdecks_url"]
+    log.info("Fetching %s matchup data from %s", format_name, url)
 
-    time.sleep(SCRAPE_DELAY)
-    try:
-        # MTGDecks uses Cloudflare JS challenge — cloudscraper handles it
-        if cloudscraper is not None:
-            scraper = cloudscraper.create_scraper()
-            resp = scraper.get(MTGDECKS_WINRATES_URL, timeout=30)
+    for attempt in range(1, MAX_RETRIES + 1):
+        time.sleep(SCRAPE_DELAY)
+        try:
+            # MTGDecks uses Cloudflare JS challenge — cloudscraper handles it
+            if cloudscraper is not None:
+                scraper = cloudscraper.create_scraper()
+                resp = scraper.get(url, timeout=30)
+            else:
+                log.warning("cloudscraper not installed; falling back to requests "
+                            "(may fail on Cloudflare-protected sites)")
+                resp = requests.get(url, headers=HEADERS, timeout=30)
+            resp.raise_for_status()
+        except requests.RequestException as e:
+            log.warning("Attempt %d/%d failed to fetch matchup data: %s",
+                        attempt, MAX_RETRIES, e)
+            if attempt < MAX_RETRIES:
+                wait = RETRY_BACKOFF[attempt - 1]
+                log.info("  Retrying in %ds...", wait)
+                time.sleep(wait)
+                continue
+            return []
+
+        soup = BeautifulSoup(resp.text, "lxml")
+        table = soup.find("table", id="winrates")
+        if table:
+            break  # success
+
+        # Got a page but no table — likely a Cloudflare challenge page
+        log.warning("Attempt %d/%d: no table#winrates found (possible Cloudflare block)",
+                    attempt, MAX_RETRIES)
+        if attempt < MAX_RETRIES:
+            wait = RETRY_BACKOFF[attempt - 1]
+            log.info("  Retrying in %ds...", wait)
+            time.sleep(wait)
         else:
-            log.warning("cloudscraper not installed; falling back to requests "
-                        "(may fail on Cloudflare-protected sites)")
-            resp = requests.get(MTGDECKS_WINRATES_URL, headers=HEADERS, timeout=30)
-        resp.raise_for_status()
-    except requests.RequestException as e:
-        log.warning("Failed to fetch matchup data: %s", e)
-        return []
+            log.warning("All %d attempts failed — returning empty matchup data", MAX_RETRIES)
+            return []
 
-    soup = BeautifulSoup(resp.text, "lxml")
-    table = soup.find("table", id="winrates")
-    if not table:
-        log.warning("No table#winrates found on page")
-        return []
-
-    return _parse_winrate_table(table)
+    return _parse_winrate_table(table, format_name=format_name)
 
 
-def _parse_winrate_table(table) -> list[dict]:
+def _parse_winrate_table(table, format_name: str = "standard") -> list[dict]:
     """Parse the MTGDecks winrate matrix table.
 
     Structure:
@@ -137,6 +165,7 @@ def _parse_winrate_table(table) -> list[dict]:
                 "sample_size": sample_size,
                 "snapshot_date": snapshot_date,
                 "source": "mtgdecks",
+                "format": format_name,
             })
 
     # Normalize archetype names to match MTGGoldfish convention
@@ -158,11 +187,12 @@ def _normalize_archetype_name(name: str) -> str:
     return re.sub(r"\bMono\s+", "Mono-", name)
 
 
-def run() -> pd.DataFrame:
+def run(format_name: str = "standard") -> pd.DataFrame:
     """Full pipeline: scrape → save (replaces stale data)."""
-    DATA_PROCESSED.mkdir(parents=True, exist_ok=True)
+    matchup_path = format_path(MATCHUPS_PARQUET, format_name)
+    matchup_path.parent.mkdir(parents=True, exist_ok=True)
 
-    matchups = scrape_mtgdecks_matchups()
+    matchups = scrape_mtgdecks_matchups(format_name)
     df = pd.DataFrame(matchups)
 
     if not df.empty:
@@ -171,8 +201,8 @@ def run() -> pd.DataFrame:
             subset=["archetype_a", "archetype_b", "snapshot_date"],
             keep="last",
         )
-        df.to_parquet(MATCHUPS_PARQUET, index=False)
-        log.info("Saved %d matchup rows to %s", len(df), MATCHUPS_PARQUET)
+        df.to_parquet(matchup_path, index=False)
+        log.info("Saved %d %s matchup rows to %s", len(df), format_name, matchup_path)
 
         # Summary
         unique_archs = set(df["archetype_a"].unique()) | set(df["archetype_b"].unique())
@@ -184,12 +214,12 @@ def run() -> pd.DataFrame:
                      df["sample_size"].dropna().astype(int).min(),
                      df["sample_size"].dropna().astype(int).max())
     else:
-        log.warning("No matchup data collected. Saving empty parquet.")
+        log.warning("No %s matchup data collected. Saving empty parquet.", format_name)
         df = pd.DataFrame(columns=[
             "archetype_a", "archetype_b", "win_rate_a", "win_rate_b",
-            "sample_size", "snapshot_date", "source",
+            "sample_size", "snapshot_date", "source", "format",
         ])
-        df.to_parquet(MATCHUPS_PARQUET, index=False)
+        df.to_parquet(matchup_path, index=False)
 
     return df
 
