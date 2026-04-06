@@ -168,39 +168,56 @@ Initialize:
     budget = 60                      # remaining card slots
     selected = {}                    # set of already-selected card indices
     deck = {}                        # card_index -> count mapping
+    color_counts = [0]*5             # running WUBRG color density
+    type_counts = [0]*7              # running card type density
+    cards_placed = 0                 # total cards placed so far
 
 Loop (step t = 0, 1, 2, ...):
-    1. Compute context query q_t from [a_i, mean(card_context)] via MLP
-    2. Score all eligible candidate cards via MLP scoring
-    3. Select card s_t (highest scoring eligible card)
-    4. Predict count n_t for selected card
-    5. Context correction (training only):
+    1. Build budget features: [budget/60, color_density(5), type_density(7), cards_placed/60]
+    2. Compute context query q_t from [a_i, mean(card_context), budget_features] via MLP
+    3. Score all eligible candidate cards via MLP scoring
+    4. Apply temperature scaling to logits (training only): logits / T
+    5. Select card s_t (highest scoring eligible card)
+    6. Predict count n_t for selected card
+    7. Scheduled sampling + context correction (training only):
         - If s_t is NOT in the target deck and remaining GT cards exist:
-          substitute a random remaining target card into the context
+          flip coin weighted by teacher_forcing_rate.
+          Heads: substitute highest-consensus remaining GT card (deterministic order)
+          Tails: keep model's own wrong pick in context
         - Otherwise: use the model's selection
-    6. Append count-conditioned card embedding to card_context
-    7. Update budget, selected, deck
-    8. If budget == 0: terminate and return deck
+    8. Append count-conditioned card embedding to card_context
+    9. Update budget, selected, deck, color_counts, type_counts
+   10. If budget == 0: terminate and return deck
 ```
 
 ### 4.2 Context Aggregation
 
-At step `t`, the deck context consists of the archetype embedding `a_i` (fixed throughout) and a list of previously selected card+count embeddings. Rather than attending over a growing sequence, the selected card embeddings are mean-pooled into a single summary vector and concatenated with the archetype embedding. A 2-layer MLP projects this fixed-size input into the query vector `q_t`:
+At step `t`, the deck context consists of the archetype embedding `a_i` (fixed throughout), a list of previously selected card+count embeddings, and an optional budget feature vector encoding the partial deck state.
+
+The selected card embeddings are mean-pooled into a single summary vector and concatenated with the archetype embedding and budget features. A 2-layer MLP projects this fixed-size input into the query vector `q_t`:
 
 ```
 card_mean = MeanPool(card_context) in R^{d_model}   # zero vector if no cards selected yet
-q_t = MLP_proj([a_i || card_mean]) in R^{d_model}
+budget_features = [budget/60, color_density(5), type_density(7), cards_placed/60] in R^{14}
+q_t = MLP_proj([a_i || card_mean || budget_features]) in R^{d_model}
 ```
 
+The 14-dim budget feature vector contains:
+- **Remaining budget fraction** (1): `budget / 60`
+- **Color density** (5): running count of W/U/B/R/G cards divided by cards placed
+- **Type density** (7): running count of creature/instant/sorcery/land/planeswalker/enchantment/artifact cards divided by cards placed
+- **Progress fraction** (1): `cards_placed / 60`
+
 MLP projection config:
-- Input: `2 * d_model` (archetype + card mean concatenation)
-- Architecture: `Linear(2*d_model, d_model) -> ReLU -> Linear(d_model, d_model) -> LayerNorm -> Dropout`
+- Input: `2 * d_model + 14` (archetype + card mean + budget features) when budget signal enabled, `2 * d_model` otherwise
+- Architecture: `Linear(input_dim, d_model) -> ReLU -> Linear(d_model, d_model) -> LayerNorm -> Dropout`
 - Output: `d_model`
 
 This design ensures:
 - The archetype signal is always at full strength (never diluted by mean-pooling over a growing sequence)
 - The MLP input is fixed-size at every step, enabling more stable learning
-- The projection learns to combine "what am I building" (archetype) with "what have I picked so far" (card summary)
+- The projection learns to combine "what am I building" (archetype) with "what have I picked so far" (card summary) and "what does my deck need" (budget state)
+- The explicit budget signal provides a direct signal about remaining slots, color balance, and type distribution
 
 The output `q_t` is the query vector for MLP scoring over the card pool.
 
@@ -291,12 +308,17 @@ After selecting card `s_t` with count `n_t` (or ground-truth count during traini
 
 ## 5. Training Procedure
 
-### 5.1 Argmax Selection with Context Correction and Count Teacher Forcing
+### 5.1 Argmax Selection with Scheduled Sampling and Context Correction
 
-The model uses argmax for both card selection and count prediction during training, with two forms of teacher forcing to keep the autoregressive state grounded:
+The model uses argmax for both card selection and count prediction during training, with several mechanisms to keep the autoregressive state grounded while progressively exposing the model to its own errors:
 
 - **Correct pick:** The model's selected card is used for the loss. The **ground-truth count** is teacher-forced into the deck state and context update (preventing budget drift), while the model's predicted count is used for loss computation.
-- **Wrong pick:** The loss penalizes the wrong selection. For the context update, a random remaining ground-truth card is substituted with its ground-truth count. If no remaining ground-truth cards are available, the model's pick is used as fallback.
+- **Wrong pick + scheduled sampling:** A coin is flipped, weighted by the current teacher forcing rate (anneals from 1.0 to ~0.4 over training):
+  - **Heads (teacher force):** The highest-consensus remaining GT card is substituted into the context with its GT count. Card ordering is deterministic: sorted by inclusion rate descending, then copy count descending, then card name ascending. This teaches the model to prioritize staples over flex slots.
+  - **Tails (model's own pick):** The model's wrong card enters the context with its predicted count. The loss still penalizes the wrong selection, but the model learns to recover from its own mistakes.
+- If no remaining ground-truth cards are available, the model's pick is used as fallback regardless of the coin flip.
+
+**Scheduled sampling schedule:** Linear (default) or exponential annealing from `SCHEDULED_SAMPLING_START` (1.0) to `SCHEDULED_SAMPLING_END` (0.4). At rate 1.0, behavior is identical to the original always-substitute strategy.
 
 At inference, no teacher forcing is applied -- the model runs purely on its own greedy selections.
 
@@ -315,6 +337,14 @@ Where `s_t*` and `n_t*` are evaluated against the ground-truth target deck.
 
 - If `s_t` IS in the target deck: `L_select_t = -log p(s_t)` (reward the selection), `L_count_t = -log p(n = target_count_for_s_t)` (train count accuracy)
 - If `s_t` is NOT in the target deck: `L_select_t` penalizes the selection by rewarding the probability mass that *should* have gone to target deck cards. Specifically: `L_select_t = -log( SUM_{j in target_remaining} p(j) )` -- the negative log of total probability on all remaining target cards. Mask out `L_count` for this step (count is meaningless for a wrong card).
+
+**Consensus weighting:** When enabled, correct-card losses are weighted by the card's inclusion rate across training decklists. A card appearing in 95% of an archetype's decklists gets weight ~0.95; a flex card in 20% of lists gets weight clamped to `consensus_min_weight` (default 0.2). This penalizes missing staples more heavily than missing flex slots.
+
+```
+w_t = max(inclusion_rate(s_t), consensus_min_weight)    # only for correct picks
+L_select_t *= w_t
+L_count_t  *= w_t
+```
 
 Total loss per deck:
 
@@ -343,6 +373,11 @@ The set of card indices present in `deck` is the target card set. The model's se
 |---------|-------------|
 | **AdamW optimizer** | Decoupled weight decay regularization with differential learning rates: GNN backbone uses `base_lr * gnn_lr_scale` (default 0.1), decoder uses `base_lr` |
 | **LR warmup + scheduling** | Linear warmup (default 5 epochs) followed by cosine annealing (also supports linear or no schedule). Both parameter groups share the same schedule. |
+| **Scheduled sampling** | Anneals teacher forcing rate from 1.0 to 0.4 (linear or exponential). At each wrong-pick step, a weighted coin flip decides whether to substitute a GT card or keep the model's own pick. Reduces train/inference distribution mismatch. |
+| **Consensus-weighted loss** | Per-step card selection and count losses weighted by the card's inclusion rate across decklists. Staples (high inclusion) penalized heavily; flex slots (low inclusion) penalized lightly. Floor weight prevents flex cards from being ignored entirely. |
+| **Deterministic card ordering** | Target cards sorted by inclusion rate desc → copy count desc → name asc. Context correction substitutes the highest-priority remaining GT card, teaching the model to lock in staples early. |
+| **Budget signal** | 14-dim feature vector (remaining budget, color density, type density, progress) injected into the context encoder at each decode step. Provides explicit partial-deck state information. |
+| **Temperature-annealed scoring** | Softmax temperature on card selection logits anneals from 2.0 (flat, more gradient to near-misses) to 0.5 (sharp, focused gradient). Argmax selection is unaffected (monotonic). Training only. |
 | **Archetype-holdout cross-validation** | K-fold CV (default: 5 folds, 3 held-out archetypes per fold). Evaluates generalization to unseen archetypes. |
 | **Early stopping** | Patience-based on Jaccard metric (default: 10 validation rounds) |
 | **Gradient clipping** | `clip_grad_norm_(max_norm=1.0)` |
@@ -380,17 +415,18 @@ Output: deck dictionary {card_index: count}
 1. Run GNN forward pass to get all card/archetype/set embeddings
 2. Initialize a_i = archetype embedding, card_context = [], budget = 60, selected = {}, deck = {}
 3. While budget > 0:
-    a. q_t = MLP_proj([a_i || mean(card_context)])  (zero vector if empty)
-    b. Score all eligible cards via MLP scoring
-    c. s_t = argmax(scores)
-    d. Predict count: n_t = argmax(count_logits) (after masking invalid counts)
-    e. Clamp: n_t = min(n_t, budget)
-    f. Append count-conditioned card embedding to card_context
-    g. Update budget, selected, deck
+    a. Build budget features: [budget/60, color_density, type_density, cards_placed/60]
+    b. q_t = MLP_proj([a_i || mean(card_context) || budget_features])
+    c. Score all eligible cards via MLP scoring (no temperature at inference)
+    d. s_t = argmax(scores)
+    e. Predict count: n_t = argmax(count_logits) (after masking invalid counts)
+    f. Clamp: n_t = min(n_t, budget)
+    g. Append count-conditioned card embedding to card_context
+    h. Update budget, selected, deck, color/type accumulators
 4. Return deck
 ```
 
-No context correction is applied at inference -- the model runs greedy end-to-end.
+No context correction, scheduled sampling, or temperature scaling is applied at inference -- the model runs greedy end-to-end. Budget signal features are computed at inference just as during training.
 
 ### 6.1 Beam Search (Optional Enhancement, Not Yet Implemented)
 
@@ -420,6 +456,15 @@ For higher-quality predictions, maintain `B` candidate partial decks at each ste
 | `num_cv_folds` | 5 | Cross-validation folds |
 | `num_val_archetypes` | 3 | Held-out archetypes per fold |
 | `recency_days` | 30 | Decklist freshness filter |
+| `consensus_loss_weighting` | false | Weight loss by card inclusion rate |
+| `consensus_loss_min_weight` | 0.2 | Floor weight for low-inclusion flex slots |
+| `scheduled_sampling_start` | 1.0 | Initial teacher forcing rate (1.0 = always substitute) |
+| `scheduled_sampling_end` | 0.4 | Final teacher forcing rate |
+| `scheduled_sampling_schedule` | linear | Annealing schedule: linear or exponential |
+| `budget_signal` | true | Inject partial deck state features (14-dim) into context encoder |
+| `scorer_temp_start` | 2.0 | Initial softmax temperature on card scorer |
+| `scorer_temp_end` | 0.5 | Final softmax temperature on card scorer |
+| `scorer_temp_schedule` | linear | Temperature annealing schedule: linear or exponential |
 
 ---
 
@@ -468,11 +513,12 @@ The following PyTorch `nn.Module` classes comprise the implementation:
 - Output: final embeddings for all node types `{type: R^{N x d_model}}`
 
 ### 8.6 `DeckContextEncoder`
-- Mean-pools selected card embeddings and concatenates with the archetype embedding
-- 2-layer MLP projection: `Linear(2*d_model, d_model) -> ReLU -> Linear(d_model, d_model) -> LayerNorm -> Dropout`
+- Mean-pools selected card embeddings and concatenates with the archetype embedding and optional budget features
+- 2-layer MLP projection: `Linear(2*d_model + n_budget, d_model) -> ReLU -> Linear(d_model, d_model) -> LayerNorm -> Dropout`
+- When budget signal enabled, `n_budget = 14` (remaining budget, color density, type density, progress)
 - Fixed-size input at every step — archetype signal never diluted
 - Falls back to zero vector when no cards selected yet (step 0)
-- Input: `arch_emb in R^{d_model}`, `card_embs in R^{num_selected x d_model}` (or None)
+- Input: `arch_emb in R^{d_model}`, `card_embs in R^{num_selected x d_model}` (or None), `budget_features in R^{14}` (or None)
 - Output: `q_t in R^{d_model}`
 
 ### 8.7 `MLPCardScorer`
@@ -507,21 +553,23 @@ The following PyTorch `nn.Module` classes comprise the implementation:
 ### 8.11 `DeckConstructor`
 - Top-level module that orchestrates the full autoregressive loop
 - Holds: `DeckContextEncoder`, `MLPCardScorer`, `NonBasicCountHead`, `BasicLandCountHead`, `CountEmbedding`, `ContextMerge`
-- Implements the step-by-step deck construction loop with context correction and count teacher forcing
-- Accepts optional `target_deck` for teacher forcing during training
+- Optionally holds card color/type flag buffers for budget signal computation
+- Implements the step-by-step deck construction loop with scheduled sampling, deterministic-order context correction, count teacher forcing, budget signal, and temperature-annealed scoring
+- Accepts optional `target_deck`, `target_order`, `teacher_forcing_rate`, and `temperature`
 - Uses argmax for both card selection and count prediction
-- During training: context correction substitutes GT cards on wrong picks; count teacher forcing uses GT counts on correct picks
-- Tracks budget, selected set, target remaining set, and card context list
-- Input: archetype embedding `a_i`, all card embeddings `C`, basic land mask, greedy flag, optional target_deck
+- During training: scheduled sampling controls when to substitute GT cards; deterministic ordering controls which GT card; temperature scales logits before softmax
+- Tracks budget, selected set, target remaining set, card context list, and budget signal accumulators (color counts, type counts, cards placed)
+- Input: archetype embedding, card embeddings, basic land mask, greedy flag, optional target_deck/target_order/tf_rate/temperature
 - Output: dict with `deck` ({card_index: count}) and `steps` (per-step logits/probs for loss)
 
 ### 8.12 `MTGDeckModel`
 - Top-level wrapper that combines everything
 - Holds: `HeteroGNN` (with `NodeEncoder` per type), `DeckConstructor`
 - Precomputes and registers basic land mask from card names
-- Input: HeteroData graph, archetype index, greedy flag, optional target_deck
+- Passes optional card color/type flag tensors to `DeckConstructor` for budget signal
+- Input: HeteroData graph, archetype index, greedy flag, optional target_deck/target_order/tf_rate/temperature
 - Output: dict with `deck` and `steps`
-- Convenience method `predict_deck()` for greedy inference
+- Convenience method `predict_deck()` for greedy inference (no teacher forcing, no temperature)
 
 ---
 
@@ -595,6 +643,16 @@ Used to set the basic land mask per card, which controls routing between `NonBas
 7. **Hadamard product in card scorer and count heads:** The element-wise product `q_t * c_j` enables the MLPs to learn multiplicative feature interactions between the deck context and the candidate card, which is more expressive than concatenation alone. Used in both the card selection MLP and both count prediction heads.
 
 8. **Separate count heads for basic vs non-basic:** Non-basic counts (1–4) and basic land counts (1–20) have very different distributions. Separate heads give each sub-problem the right-sized output space, eliminating masking gymnastics and allowing each to specialize.
+
+9. **Scheduled sampling (annealed teacher forcing):** Pure teacher forcing at training time creates a distribution mismatch: the model only ever sees perfect histories during training but must handle its own mistakes at inference. Annealing from 100% to ~40% teacher forcing forces the model to learn recovery from its own errors. The coin flip is per-step, not per-epoch, giving fine-grained exposure to autoregressive errors.
+
+10. **Consensus-weighted loss:** A card appearing in 95% of an archetype's decklists is a near-deterministic pick; a card in 20% is a legitimate flex slot. Equal penalization of both wastes gradient signal on inherently unpredictable flex choices. Weighting by inclusion rate focuses learning on the high-consensus cards that matter most for precision.
+
+11. **Deterministic card ordering:** When context correction substitutes a GT card, choosing by inclusion rate (highest first) rather than randomly teaches the model a natural deck-building strategy: lock in format staples early, fill flex slots later. This mirrors how humans build decks and lets the model naturally achieve higher precision on early (high-consensus) steps.
+
+12. **Budget signal (explicit partial deck state):** Mean-pooling selected card embeddings provides an implicit summary of the partial deck, but lacks explicit information about remaining card slots, color balance, and type distribution. A 14-dim feature vector of normalized budget, color density, and type density gives the MLP scorer a direct signal for decisions like "I need more lands" or "I've already filled my creature slots."
+
+13. **Temperature annealing on card scorer:** High temperature (2.0) early in training flattens the softmax distribution, giving more gradient flow to near-miss candidates. Low temperature (0.5) late in training sharpens the distribution, focusing gradient on the top candidates. Since argmax is monotonic and unaffected by temperature, card selection is identical — only the gradient landscape changes.
 
 9. **Count-conditioned context update:** Embedding a card as "3 copies of Sheoldred" rather than just "Sheoldred" lets subsequent attention steps reason about deck composition more precisely (e.g., "I already have 3 Sheoldred, so I don't need more top-end threats").
 

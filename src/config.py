@@ -99,6 +99,21 @@ EDGE_CHUNK_SIZE = int(os.getenv("EDGE_CHUNK_SIZE", "2000000"))
 
 # Loss weights
 COUNT_LOSS_WEIGHT = float(os.getenv("COUNT_LOSS_WEIGHT", "1.0"))
+CONSENSUS_LOSS_WEIGHTING = bool(int(os.getenv("CONSENSUS_LOSS_WEIGHTING", "0")))
+CONSENSUS_LOSS_MIN_WEIGHT = float(os.getenv("CONSENSUS_LOSS_MIN_WEIGHT", "0.2"))
+
+# Scheduled sampling: anneal teacher forcing rate from START to END over training
+SCHEDULED_SAMPLING_START = float(os.getenv("SCHEDULED_SAMPLING_START", "1.0"))
+SCHEDULED_SAMPLING_END = float(os.getenv("SCHEDULED_SAMPLING_END", "0.4"))
+SCHEDULED_SAMPLING_SCHEDULE = os.getenv("SCHEDULED_SAMPLING_SCHEDULE", "linear")
+
+# Budget signal: inject partial deck state features into context encoder
+BUDGET_SIGNAL = bool(int(os.getenv("BUDGET_SIGNAL", "1")))
+
+# Temperature annealing on MLP card scorer during training
+SCORER_TEMP_START = float(os.getenv("SCORER_TEMP_START", "2.0"))
+SCORER_TEMP_END = float(os.getenv("SCORER_TEMP_END", "0.5"))
+SCORER_TEMP_SCHEDULE = os.getenv("SCORER_TEMP_SCHEDULE", "linear")
 
 # Deck construction constraints
 MAX_DECK_SIZE = int(os.getenv("MAX_DECK_SIZE", "60"))

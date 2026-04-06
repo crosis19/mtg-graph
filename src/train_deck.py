@@ -25,7 +25,10 @@ import torch_geometric  # noqa: F401 — must be fully loaded before torch.load 
 
 from src.config import (
     ACTIVE_FORMATS,
+    BUDGET_SIGNAL,
     CARDS_PARQUET,
+    CONSENSUS_LOSS_MIN_WEIGHT,
+    CONSENSUS_LOSS_WEIGHTING,
     COUNT_LOSS_WEIGHT,
     CURRICULUM_NEG_EPOCHS,
     CURRICULUM_NEG_SCHEDULE,
@@ -53,8 +56,15 @@ from src.config import (
     DECK_WARMUP_EPOCHS,
     GRAPH_PATH,
     MAX_BASIC_LAND_COUNT,
+    MAX_DECK_SIZE,
     MAX_NONBASIC_COUNT,
     NUM_GNN_LAYERS,
+    SCHEDULED_SAMPLING_END,
+    SCHEDULED_SAMPLING_SCHEDULE,
+    SCHEDULED_SAMPLING_START,
+    SCORER_TEMP_END,
+    SCORER_TEMP_SCHEDULE,
+    SCORER_TEMP_START,
     TRANSFER_FINETUNE_EPOCHS,
     TRANSFER_FINETUNE_LR_SCALE,
     TRANSFER_GNN_FREEZE_EPOCHS,
@@ -95,13 +105,14 @@ def _filter_recent_decklists(decklists: pd.DataFrame, days: int) -> pd.DataFrame
 def _build_ground_truth(
     data,
     decklists: pd.DataFrame,
-) -> dict[int, dict[int, int]]:
+) -> tuple[dict[int, dict[int, int]], dict[int, dict[int, float]]]:
     """Build per-archetype ground truth with raw integer copy counts.
 
     Uses only the latest snapshot per archetype so counts reflect the
-    current meta. Returns {arch_idx: {card_idx: count}} where counts
-    sum to 60. Non-basic cards are clamped to [1, 4], basic lands to
-    [1, 20].
+    current meta. Returns:
+      - ground_truth: {arch_idx: {card_idx: count}} where counts sum to 60
+      - inclusion_rates: {arch_idx: {card_idx: float}} from inclusion_pct column
+    Non-basic cards are clamped to [1, 4], basic lands to [1, 20].
     """
     arch_names = data["archetype"].names
     card_names = data["card"].names
@@ -113,6 +124,7 @@ def _build_ground_truth(
             card_to_idx.setdefault(name.split(" // ")[0], idx)
 
     copies_col = "avg_copies" if "avg_copies" in decklists.columns else "copies"
+    has_inclusion = "inclusion_pct" in decklists.columns
 
     # Filter to mainboard only
     if "board" in decklists.columns:
@@ -125,13 +137,17 @@ def _build_ground_truth(
         decklists = decklists[decklists["snapshot_date"] == latest]
 
     # One row per (archetype, card) — no cross-snapshot aggregation needed
+    agg_cols = [copies_col]
+    if has_inclusion:
+        agg_cols.append("inclusion_pct")
     agg = (
-        decklists.groupby(["archetype", "card_name"])[copies_col]
+        decklists.groupby(["archetype", "card_name"])[agg_cols]
         .first()
         .reset_index()
     )
 
     ground_truth: dict[int, dict[int, int]] = {}
+    inclusion_rates: dict[int, dict[int, float]] = {}
 
     for _, row in agg.iterrows():
         arch = row["archetype"]
@@ -159,12 +175,16 @@ def _build_ground_truth(
 
         ground_truth.setdefault(a_idx, {})[c_idx] = copies
 
+        # Capture inclusion rate
+        inc = float(row["inclusion_pct"]) if has_inclusion else 1.0
+        inclusion_rates.setdefault(a_idx, {})[c_idx] = inc
+
     # Log summary
     for a_idx, cards in ground_truth.items():
         total = sum(cards.values())
         log.info(f"  Archetype {arch_names[a_idx]}: {len(cards)} unique cards, {total} total copies")
 
-    return ground_truth
+    return ground_truth, inclusion_rates
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -234,8 +254,49 @@ def _compute_curriculum_mask(
 
 
 # ════════════════════════════════════════════════════════════════════
-#  Temperature Schedule
+#  Annealing Schedule
 # ════════════════════════════════════════════════════════════════════
+
+
+def _anneal_value(
+    epoch: int, num_epochs: int, start: float, end: float, schedule: str,
+) -> float:
+    """Linearly or exponentially interpolate between *start* and *end*.
+
+    Used for scheduled sampling rate, scorer temperature, and any other
+    value that needs to anneal over the course of training.
+    """
+    frac = min(epoch / max(num_epochs - 1, 1), 1.0)
+    if schedule == "exponential" and start > 0 and end > 0:
+        return start * (end / start) ** frac
+    return start + (end - start) * frac
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Deterministic Card Ordering
+# ════════════════════════════════════════════════════════════════════
+
+
+def _build_target_order(
+    ground_truth: dict[int, dict[int, int]],
+    inclusion_rates: dict[int, dict[int, float]],
+    card_names: list[str],
+) -> dict[int, list[int]]:
+    """Sort each archetype's target cards for deterministic decoding.
+
+    Ordering: highest inclusion rate first, then copy count descending,
+    then card name ascending (alphabetical tiebreaker). The model learns
+    to lock in staples early and fill flex slots later.
+    """
+    target_orders: dict[int, list[int]] = {}
+    for a_idx, cards in ground_truth.items():
+        inc = inclusion_rates.get(a_idx, {})
+        order = sorted(
+            cards.keys(),
+            key=lambda c: (-inc.get(c, 1.0), -cards[c], card_names[c]),
+        )
+        target_orders[a_idx] = order
+    return target_orders
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -247,6 +308,8 @@ def compute_step_losses(
     steps: list[dict],
     target_deck: dict[int, int],
     count_loss_weight: float,
+    inclusion_rates: dict[int, float] | None = None,
+    consensus_min_weight: float = 0.2,
 ) -> tuple[torch.Tensor, dict]:
     """Compute per-step card selection and count prediction losses.
 
@@ -258,10 +321,16 @@ def compute_step_losses(
           L_select = -log(sum of probs on all remaining target cards)
           L_count  = 0 (masked)
 
+    When *inclusion_rates* is provided, correct-card losses are weighted
+    by the card's consensus rate (clamped to *consensus_min_weight*).
+    Staples get weight ~1.0; flex slots get the floor weight.
+
     Args:
         steps: per-step dicts from DeckConstructor.forward().
         target_deck: {card_idx: count} ground truth.
         count_loss_weight: lambda weighting for count loss.
+        inclusion_rates: optional {card_idx: float} consensus rates.
+        consensus_min_weight: floor weight for low-inclusion cards.
 
     Returns:
         (total_loss, metrics_dict)
@@ -282,7 +351,14 @@ def compute_step_losses(
         if card_idx in target_remaining:
             # Correct card selected — reward this choice
             prob = select_probs[card_idx].clamp(min=1e-10)
-            total_select_loss = total_select_loss + (-torch.log(prob))
+            step_select_loss = -torch.log(prob)
+
+            # Consensus weighting: penalize missing staples more heavily
+            if inclusion_rates is not None:
+                cw = max(inclusion_rates.get(card_idx, 1.0), consensus_min_weight)
+                step_select_loss = step_select_loss * cw
+
+            total_select_loss = total_select_loss + step_select_loss
             n_select += 1
             n_correct_cards += 1
 
@@ -298,6 +374,9 @@ def compute_step_losses(
                     target_tensor = torch.tensor(gt_count_idx, device=count_logits.device)
                     # Use only valid positions for cross-entropy
                     ce = F.cross_entropy(count_logits.unsqueeze(0), target_tensor.unsqueeze(0))
+                    if inclusion_rates is not None:
+                        cw = max(inclusion_rates.get(card_idx, 1.0), consensus_min_weight)
+                        ce = ce * cw
                     total_count_loss = total_count_loss + ce
                     n_count += 1
 
@@ -666,6 +745,15 @@ def train_deck(device=None, trial=None, **overrides):
         "batch_strategy": overrides.get("batch_strategy", DECK_BATCH_STRATEGY),
         "color_loss_weighting": overrides.get("color_loss_weighting", DECK_COLOR_LOSS_WEIGHTING),
         "top_n_archetypes": overrides.get("top_n_archetypes", DECK_TOP_N_ARCHETYPES),
+        "consensus_loss_weighting": overrides.get("consensus_loss_weighting", CONSENSUS_LOSS_WEIGHTING),
+        "consensus_loss_min_weight": overrides.get("consensus_loss_min_weight", CONSENSUS_LOSS_MIN_WEIGHT),
+        "scheduled_sampling_start": overrides.get("scheduled_sampling_start", SCHEDULED_SAMPLING_START),
+        "scheduled_sampling_end": overrides.get("scheduled_sampling_end", SCHEDULED_SAMPLING_END),
+        "scheduled_sampling_schedule": overrides.get("scheduled_sampling_schedule", SCHEDULED_SAMPLING_SCHEDULE),
+        "budget_signal": overrides.get("budget_signal", BUDGET_SIGNAL),
+        "scorer_temp_start": overrides.get("scorer_temp_start", SCORER_TEMP_START),
+        "scorer_temp_end": overrides.get("scorer_temp_end", SCORER_TEMP_END),
+        "scorer_temp_schedule": overrides.get("scorer_temp_schedule", SCORER_TEMP_SCHEDULE),
     }
 
     results_base = overrides.get("results_base", None)
@@ -716,7 +804,7 @@ def train_deck(device=None, trial=None, **overrides):
 
     # ── Build ground truth ──
     log.info("\nBuilding ground truth (raw integer counts)...")
-    ground_truth = _build_ground_truth(data, decklists)
+    ground_truth, inclusion_rates = _build_ground_truth(data, decklists)
 
     # ── Identify deck vs negative cards for curriculum sampling ──
     n_total_cards = data["card"].x.shape[0]
@@ -760,10 +848,31 @@ def train_deck(device=None, trial=None, **overrides):
     else:
         log.info(f"  Training on all {len(ground_truth)} archetypes with ground truth")
 
+    # ── Deterministic card ordering for context correction ──
+    card_names_pre = data["card"].names
+    target_orders = _build_target_order(ground_truth, inclusion_rates, card_names_pre)
+    log.info(f"  Built deterministic target orders for {len(target_orders)} archetypes")
+
+    # ── Extract card metadata for budget signal ���─
+    card_color_flags = None
+    card_type_flags = None
+    if hp["budget_signal"]:
+        emb_dim = 384
+        card_x = data["card"].x
+        # Scalar feature layout after embedding: cmc_norm(0), is_creature(1)..is_artifact(7),
+        # is_battle(8), rarity_enc(9), is_white(10)..is_green(14), is_colorless(15), ...
+        card_type_flags = card_x[:, emb_dim + 1 : emb_dim + 8].clone()   # 7 type flags
+        card_color_flags = card_x[:, emb_dim + 10 : emb_dim + 15].clone()  # 5 color flags (WUBRG)
+        log.info(f"  Budget signal: extracted type ({card_type_flags.shape[1]}) "
+                 f"and color ({card_color_flags.shape[1]}) flags for {card_x.shape[0]} cards")
+
     # ── Move to device ──
     data = data.to(device)
     card_names = data["card"].names
     arch_names = data["archetype"].names
+    if card_color_flags is not None:
+        card_color_flags = card_color_flags.to(device)
+        card_type_flags = card_type_flags.to(device)
 
     # ── Create CV folds ──
     all_arch_indices = sorted(ground_truth.keys())
@@ -799,6 +908,8 @@ def train_deck(device=None, trial=None, **overrides):
             num_gnn_layers=hp["num_gnn_layers"],
             dropout=hp["dropout"],
             edge_chunk_size=hp["edge_chunk_size"],
+            card_color_flags=card_color_flags,
+            card_type_flags=card_type_flags,
         ).to(device)
 
         # Load pretrained weights for finetune mode
@@ -913,6 +1024,25 @@ def train_deck(device=None, trial=None, **overrides):
         for epoch in range(1, hp["num_epochs"] + 1):
             model.train()
 
+            # Scheduled sampling: anneal teacher forcing rate
+            tf_rate = _anneal_value(
+                epoch, hp["num_epochs"],
+                hp["scheduled_sampling_start"],
+                hp["scheduled_sampling_end"],
+                hp["scheduled_sampling_schedule"],
+            )
+
+            # Temperature annealing on card scorer
+            temperature = _anneal_value(
+                epoch, hp["num_epochs"],
+                hp["scorer_temp_start"],
+                hp["scorer_temp_end"],
+                hp["scorer_temp_schedule"],
+            )
+
+            if epoch == 1:
+                log.info(f"  Scheduled sampling: tf_rate={tf_rate:.3f}, temperature={temperature:.3f}")
+
             # Curriculum mask: restrict decoder's candidate pool early, grow to full
             curriculum_mask = _compute_curriculum_mask(
                 epoch=epoch,
@@ -1001,9 +1131,14 @@ def train_deck(device=None, trial=None, **overrides):
                         result = model.forward_with_embeddings(
                             x_dict_d, a_idx, greedy=False, target_deck=gt,
                             curriculum_mask=curriculum_mask,
+                            target_order=target_orders.get(a_idx),
+                            teacher_forcing_rate=tf_rate,
+                            temperature=temperature,
                         )
                         loss, metrics = compute_step_losses(
                             result["steps"], gt, hp["count_loss_weight"],
+                            inclusion_rates=inclusion_rates.get(a_idx) if hp["consensus_loss_weighting"] else None,
+                            consensus_min_weight=hp["consensus_loss_min_weight"],
                         )
 
                     # Decoder backward — grads accumulate in x_dict_d[nt].grad
@@ -1186,6 +1321,7 @@ def train_deck(device=None, trial=None, **overrides):
         "data": data,
         "hp": hp,
         "ground_truth": ground_truth,
+        "inclusion_rates": inclusion_rates,
         "fold_results": all_fold_results,
         "run_dir": run_dir,
     }
@@ -1217,6 +1353,13 @@ def evaluate_deck(result: dict):
 
         # Re-initialize and load best model
         node_dims = {nt: data[nt].x.shape[1] for nt in data.node_types}
+        # Extract card metadata for budget signal (same as training)
+        _eval_color = None
+        _eval_type = None
+        if hp.get("budget_signal", False):
+            emb_dim = 384
+            _eval_type = data["card"].x[:, emb_dim + 1 : emb_dim + 8].clone()
+            _eval_color = data["card"].x[:, emb_dim + 10 : emb_dim + 15].clone()
         model = MTGDeckModel(
             node_dims=node_dims,
             edge_types=list(data.edge_types),
@@ -1228,6 +1371,8 @@ def evaluate_deck(result: dict):
             num_gnn_layers=hp["num_gnn_layers"],
             dropout=hp["dropout"],
             edge_chunk_size=hp.get("edge_chunk_size", 0),
+            card_color_flags=_eval_color,
+            card_type_flags=_eval_type,
         ).to(data["card"].x.device)
 
         checkpoint = torch.load(model_path, weights_only=False)

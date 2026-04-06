@@ -12,11 +12,16 @@ This project models MTG competitive metagames as a heterogeneous graph with thre
 - **Transfer learning** — pre-train on all formats, fine-tune on Standard with GNN freezing and reduced learning rate
 - **Two-stage architecture** — HeteroGNN learns embeddings via message passing, then an MLP-scored autoregressive decoder constructs decks card-by-card
 - **Edge features with learnable edge-type weights** — graph edge weights (copy counts, synergy scores, win rates) are treated as input features to the MessageMLP, while learnable per-edge-type scalars control each relationship type's contribution
-- **Argmax selection with context correction** — same selection strategy at train and inference time, with teacher forcing to prevent error snowballing
+- **Scheduled sampling** — anneals teacher forcing rate from 100% to 40% over training, forcing the model to recover from its own mistakes
+- **Consensus-weighted loss** — penalizes missing staples (high inclusion rate) more heavily than flex slots
+- **Deterministic card ordering** — sorts target cards by consensus rate for context correction, teaching "staples first, flex later"
+- **Budget signal** — injects remaining budget, color density, and type density as explicit features into the context encoder
+- **Temperature-annealed scoring** — softmax temperature on card selection scores starts high (flat gradients) and anneals low (sharp gradients)
 - **Separate count heads** — non-basic cards (1-4 copies) and basic lands (1-20 copies) use dedicated classification heads
 - **Archetype-holdout cross-validation** — tests generalization to unseen archetypes
 - **30-day recency filter** — uses only recent decklists from MTGGoldfish
 - **Early stopping on Jaccard similarity** — checkpoints on the metric that matters
+- **Edge quality audit** — standalone tool to spot-check semantic, counter, and removal edges
 
 ## Architecture
 
@@ -47,7 +52,7 @@ This project models MTG competitive metagames as a heterogeneous graph with thre
 
 **Stage 2 (Autoregressive Deck Constructor):** Given archetype embeddings from the GNN, builds a 60-card deck one card at a time using MLP scoring over the card pool with separate count classification heads for non-basic cards (1-4) and basic lands (1-20).
 
-- **Training**: Argmax selection with context correction and count teacher forcing
+- **Training**: Argmax selection with scheduled sampling, consensus-weighted loss, deterministic card ordering, budget signal, and temperature-annealed scoring
 - **Metrics**: Jaccard similarity, precision, recall, exact count match
 
 ## Project Structure
@@ -65,6 +70,7 @@ mtg-graph/
 │   ├── card_embeddings.py     # Phase 2: Semantic embeddings (SentenceTransformer)
 │   ├── synergy_eval.py        # Phase 2: Synergy edge quality evaluation
 │   ├── card_interaction_edges.py # Phase 2: Counter/removal edge extraction
+│   ├── audit_edges.py         # Edge quality audit (spot-check synergy/counter/removal)
 │   ├── graph_builder.py       # Phase 3: Assemble multi-format HeteroData graph
 │   ├── deck_predictor.py      # Phase 4: HeteroGNN + autoregressive deck constructor
 │   ├── train_deck.py          # Phase 4: Training loop with pretrain/finetune modes
@@ -147,6 +153,14 @@ Each training run saves to a timestamped folder under `results/deck/`:
 - `model_fold*.pt` — best model checkpoint per fold
 - `training_log.json` — hyperparameters, epoch curves, final metrics
 - `dashboard.html` — interactive visualization
+
+### Edge Quality Audit
+
+```bash
+python -m src.audit_edges --type semantic --n 50 --threshold 0.65
+python -m src.audit_edges --type counter --n 50
+python -m src.audit_edges --type removal --n 50
+```
 
 ### Dashboard Generation
 

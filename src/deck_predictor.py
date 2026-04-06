@@ -20,14 +20,21 @@ Two-stage architecture for predicting competitive 60-card MTG decklists:
     (1–4) and basic lands (1–20). Builds a deck one card at a time
     until the 60-card budget is spent.
 
-Training uses argmax card selection with two forms of teacher forcing:
-  1. Context correction: when the model selects a wrong card, a random
-     ground-truth card is substituted into the context to prevent error
-     snowballing. The loss still penalizes the model's actual wrong pick.
-  2. Count teacher forcing: when the model selects a correct card, the
+Training uses argmax card selection with several mechanisms:
+  1. Scheduled sampling: anneals teacher forcing rate so the model
+     progressively sees its own errors during context correction.
+  2. Deterministic card ordering: context correction substitutes the
+     highest-consensus remaining GT card (not random).
+  3. Count teacher forcing: when the model selects a correct card, the
      ground-truth count is used for the deck state and context update
      (preventing budget drift), while the loss trains on the model's
      predicted count.
+  4. Budget signal: injects remaining budget, color density, and type
+     density as explicit features into the context encoder.
+  5. Temperature annealing: softmax temperature on card scorer logits
+     controls gradient distribution during training.
+  6. Consensus-weighted loss: penalizes missing staples more heavily
+     than flex slots based on card inclusion rates.
 """
 
 import random
@@ -368,14 +375,17 @@ class DeckContextEncoder(nn.Module):
     """Encode archetype + selected-card context into a query vector.
 
     Mean-pools the selected card embeddings and concatenates with the
-    archetype embedding, then projects via a 2-layer MLP to produce q_t.
+    archetype embedding (and optional budget features), then projects
+    via a 2-layer MLP to produce q_t.
     Fixed-size input every step — the archetype signal is never diluted.
     """
 
-    def __init__(self, d_model: int = D_MODEL, dropout: float = DROPOUT):
+    def __init__(self, d_model: int = D_MODEL, dropout: float = DROPOUT,
+                 n_budget_features: int = 0):
         super().__init__()
+        input_dim = 2 * d_model + n_budget_features
         self.proj = nn.Sequential(
-            nn.Linear(2 * d_model, d_model),
+            nn.Linear(input_dim, d_model),
             nn.ReLU(),
             nn.Linear(d_model, d_model),
             nn.LayerNorm(d_model),
@@ -383,13 +393,16 @@ class DeckContextEncoder(nn.Module):
         )
         self.d_model = d_model
 
-    def forward(self, arch_emb: torch.Tensor, card_embs: torch.Tensor | None) -> torch.Tensor:
+    def forward(self, arch_emb: torch.Tensor, card_embs: torch.Tensor | None,
+                budget_features: torch.Tensor | None = None) -> torch.Tensor:
         """Produce query vector q_t from archetype + selected card context.
 
         Args:
             arch_emb: (d_model,) — archetype embedding from GNN.
             card_embs: (num_selected, d_model) — merged card+count embeddings
                        selected so far, or None if no cards selected yet.
+            budget_features: optional (n_budget_features,) — partial deck
+                state features (remaining budget, color/type densities).
 
         Returns:
             q_t: (d_model,) — context query for card scoring.
@@ -398,7 +411,10 @@ class DeckContextEncoder(nn.Module):
             card_mean = card_embs.mean(dim=0)
         else:
             card_mean = torch.zeros(self.d_model, device=arch_emb.device)
-        return self.proj(torch.cat([arch_emb, card_mean]))
+        parts = [arch_emb, card_mean]
+        if budget_features is not None:
+            parts.append(budget_features)
+        return self.proj(torch.cat(parts))
 
 
 class MLPCardScorer(nn.Module):
@@ -564,21 +580,23 @@ class ContextMerge(nn.Module):
 
 
 class DeckConstructor(nn.Module):
-    """Autoregressive deck builder with context correction and count
-    teacher forcing.
+    """Autoregressive deck builder with scheduled sampling, consensus-
+    ordered context correction, count teacher forcing, budget signal,
+    and temperature-annealed scoring.
 
     Given an archetype embedding and the full card pool, iteratively:
-      1. Self-attend over the current deck context
-      2. Score all eligible cards via MLP
-      3. Select one card via argmax
-      4. Predict copy count for the selected card
-      5. Context correction (training only):
-         - Wrong card: substitute a random remaining ground-truth card
-           with its GT count into the context
-         - Correct card: use GT count for deck state and context update
-           (count teacher forcing prevents budget drift)
-      6. Append the count-conditioned card to the context
-      7. Repeat until the 60-card budget is exhausted
+      1. Build budget feature vector (remaining cards, color/type density)
+      2. Encode archetype + card context + budget features → query vector
+      3. Score all eligible cards via MLP (with temperature scaling)
+      4. Select one card via argmax
+      5. Predict copy count for the selected card
+      6. Scheduled sampling + context correction (training only):
+         - Wrong card + coin says teacher-force: substitute the highest-
+           priority remaining GT card (deterministic order) into context
+         - Wrong card + coin says use model: keep the model's pick
+         - Correct card: use GT count for deck state (count teacher forcing)
+      7. Append the count-conditioned card to the context
+      8. Repeat until the 60-card budget is exhausted
     """
 
     def __init__(
@@ -587,15 +605,23 @@ class DeckConstructor(nn.Module):
         d_count: int = D_COUNT,
         dropout: float = DROPOUT,
         max_count: int = MAX_BASIC_LAND_COUNT,
+        card_color_flags: torch.Tensor | None = None,
+        card_type_flags: torch.Tensor | None = None,
     ):
         super().__init__()
-        self.context_encoder = DeckContextEncoder(d_model, dropout)
+        n_budget = 14 if card_color_flags is not None else 0
+        self.context_encoder = DeckContextEncoder(d_model, dropout, n_budget_features=n_budget)
         self.card_selector = MLPCardScorer(d_model)
         self.nonbasic_count_head = NonBasicCountHead(d_model)
         self.basic_land_count_head = BasicLandCountHead(d_model, max_count)
         self.count_embedding = CountEmbedding(max_count, d_count)
         self.context_merge = ContextMerge(d_model, d_count)
         self.d_model = d_model
+        self._has_budget_signal = card_color_flags is not None
+
+        if card_color_flags is not None:
+            self.register_buffer("card_color_flags", card_color_flags)
+            self.register_buffer("card_type_flags", card_type_flags)
 
     def forward(
         self,
@@ -605,6 +631,9 @@ class DeckConstructor(nn.Module):
         greedy: bool = False,
         target_deck: dict[int, int] | None = None,
         curriculum_mask: torch.Tensor | None = None,
+        target_order: list[int] | None = None,
+        teacher_forcing_rate: float = 1.0,
+        temperature: float = 1.0,
     ) -> dict:
         """Build a deck autoregressively.
 
@@ -620,6 +649,12 @@ class DeckConstructor(nn.Module):
             curriculum_mask: (n_cards,) bool — True for cards eligible in this
                 epoch's curriculum. None means all cards eligible. Only used
                 during training to restrict the decoder's candidate pool.
+            target_order: deterministic ordering of target cards (highest
+                consensus first). Used for context correction substitution.
+            teacher_forcing_rate: probability of substituting a GT card on
+                wrong picks (scheduled sampling). 1.0 = always substitute.
+            temperature: softmax temperature for card selection scores.
+                Applied during training only (logits / T before softmax).
 
         Returns:
             dict with:
@@ -642,12 +677,28 @@ class DeckConstructor(nn.Module):
         # Track selected card embeddings for context encoding
         card_context: list[torch.Tensor] = []
 
-        while budget > 0:
-            # 1. Encode archetype + card context → query vector
-            card_embs = torch.stack(card_context) if card_context else None
-            q_t = self.context_encoder(arch_embedding, card_embs)
+        # Budget signal accumulators
+        color_counts = torch.zeros(5, device=device)
+        type_counts = torch.zeros(7, device=device)
+        cards_placed = 0
 
-            # 2. Build eligibility mask: only cards not yet selected
+        while budget > 0:
+            # 1. Build budget features if enabled
+            budget_features = None
+            if self._has_budget_signal:
+                placed_f = max(cards_placed, 1)
+                budget_features = torch.cat([
+                    torch.tensor([budget / MAX_DECK_SIZE], device=device),
+                    color_counts / placed_f,
+                    type_counts / placed_f,
+                    torch.tensor([cards_placed / MAX_DECK_SIZE], device=device),
+                ])
+
+            # 2. Encode archetype + card context + budget → query vector
+            card_embs = torch.stack(card_context) if card_context else None
+            q_t = self.context_encoder(arch_embedding, card_embs, budget_features)
+
+            # 3. Build eligibility mask: only cards not yet selected
             eligible = ~selected  # (n_cards,) bool
             if curriculum_mask is not None:
                 eligible = eligible & curriculum_mask
@@ -655,15 +706,20 @@ class DeckConstructor(nn.Module):
             if not eligible.any():
                 break  # no more eligible cards (shouldn't happen in practice)
 
-            # 3. Score all cards via MLP
+            # 4. Score all cards via MLP
             select_logits = self.card_selector(q_t, card_embeddings, eligible)
 
-            # 4. Select a card (always argmax)
+            # Temperature scaling (training only): divide logits before softmax
+            # to control gradient distribution. Argmax is unaffected (monotonic).
+            if temperature != 1.0 and not greedy:
+                select_logits = select_logits / temperature
+
+            # 5. Select a card (always argmax)
             card_idx = select_logits.argmax().item()
             card_emb = card_embeddings[card_idx]
             select_probs = F.softmax(select_logits, dim=-1)
 
-            # 5. Predict copy count via type-specific head
+            # 6. Predict copy count via type-specific head
             is_basic = basic_land_mask[card_idx].item()
             if is_basic:
                 count_logits = self.basic_land_count_head(q_t, card_emb, budget)
@@ -675,8 +731,10 @@ class DeckConstructor(nn.Module):
             count = count_idx + 1  # positions are 0-indexed, counts are 1-indexed
             count = min(count, budget)  # safety clamp
 
-            # 6. Context correction: if the model picked wrong during training,
-            #    substitute a random remaining target card into the context
+            # 7. Context correction with scheduled sampling:
+            #    If the model picked wrong during training, flip a coin weighted
+            #    by teacher_forcing_rate. Heads: substitute a GT card (in
+            #    deterministic order). Tails: keep the model's own wrong pick.
             sub_idx = None
             use_model_pick = True
             if target_deck is not None and not greedy and card_idx not in target_deck:
@@ -684,9 +742,17 @@ class DeckConstructor(nn.Module):
                 eligible_targets = [
                     c for c in target_remaining if not selected[c].item()
                 ]
-                if eligible_targets:
+                if eligible_targets and random.random() < teacher_forcing_rate:
+                    # Teacher forcing: substitute GT card (deterministic order)
                     use_model_pick = False
-                    sub_idx = random.choice(eligible_targets)
+                    if target_order is not None:
+                        # Pick the first card in deterministic order that is eligible
+                        sub_idx = next(
+                            (c for c in target_order if c in target_remaining and not selected[c].item()),
+                            None,
+                        )
+                    if sub_idx is None:
+                        sub_idx = random.choice(eligible_targets)
                     sub_count = target_deck[sub_idx]
                     sub_count = min(sub_count, budget)
                     target_remaining.discard(sub_idx)
@@ -696,6 +762,12 @@ class DeckConstructor(nn.Module):
                     selected[sub_idx] = True
                     budget -= sub_count
 
+                    # Update budget signal accumulators
+                    if self._has_budget_signal:
+                        color_counts += self.card_color_flags[sub_idx] * sub_count
+                        type_counts += self.card_type_flags[sub_idx] * sub_count
+                        cards_placed += sub_count
+
                     # Build context from substituted card
                     sub_card_emb = card_embeddings[sub_idx]
                     sub_count_idx = sub_count - 1
@@ -703,7 +775,7 @@ class DeckConstructor(nn.Module):
                     merged = self.context_merge(sub_card_emb, sub_count_emb)
                     card_context.append(merged)
 
-            # 7. Record step info for loss computation (always the model's actual pick).
+            # 8. Record step info for loss computation (always the model's actual pick).
             #    Include substituted_card_idx so the loss function can remove the
             #    substituted card from its own target tracking.
             steps.append({
@@ -717,7 +789,8 @@ class DeckConstructor(nn.Module):
             })
 
             if use_model_pick:
-                # Correct pick (or greedy / no target) — use model's selection
+                # Correct pick, greedy, no target, or scheduled sampling
+                # chose to keep model's own pick
                 if card_idx in target_remaining:
                     target_remaining.discard(card_idx)
 
@@ -730,12 +803,20 @@ class DeckConstructor(nn.Module):
                     deck[card_idx] = gt_count
                     selected[card_idx] = True
                     budget -= gt_count
+                    actual_count = gt_count
                     count_emb = self.count_embedding(gt_count - 1)
                 else:
                     deck[card_idx] = count
                     selected[card_idx] = True
                     budget -= count
+                    actual_count = count
                     count_emb = self.count_embedding(count_idx)
+
+                # Update budget signal accumulators
+                if self._has_budget_signal:
+                    color_counts += self.card_color_flags[card_idx] * actual_count
+                    type_counts += self.card_type_flags[card_idx] * actual_count
+                    cards_placed += actual_count
 
                 merged = self.context_merge(card_emb, count_emb)
                 card_context.append(merged)
@@ -768,6 +849,8 @@ class MTGDeckModel(nn.Module):
         dropout: float = DROPOUT,
         gradient_checkpointing: bool = GRADIENT_CHECKPOINTING,
         edge_chunk_size: int = EDGE_CHUNK_SIZE,
+        card_color_flags: torch.Tensor | None = None,
+        card_type_flags: torch.Tensor | None = None,
     ):
         super().__init__()
         self.gnn = HeteroGNN(
@@ -785,6 +868,8 @@ class MTGDeckModel(nn.Module):
             d_model=d_model,
             d_count=d_count,
             dropout=dropout,
+            card_color_flags=card_color_flags,
+            card_type_flags=card_type_flags,
         )
 
         # Precompute which cards are basic lands
@@ -800,6 +885,9 @@ class MTGDeckModel(nn.Module):
         greedy: bool = False,
         target_deck: dict[int, int] | None = None,
         curriculum_mask: torch.Tensor | None = None,
+        target_order: list[int] | None = None,
+        teacher_forcing_rate: float = 1.0,
+        temperature: float = 1.0,
     ) -> dict:
         """Run full model: GNN embedding + autoregressive deck construction.
 
@@ -811,6 +899,9 @@ class MTGDeckModel(nn.Module):
                 during training (see DeckConstructor.forward).
             curriculum_mask: (n_cards,) bool — curriculum eligibility mask
                 (see DeckConstructor.forward). None = all cards eligible.
+            target_order: deterministic card ordering for context correction.
+            teacher_forcing_rate: scheduled sampling rate (1.0 = always sub).
+            temperature: softmax temperature for card scorer.
 
         Returns:
             dict with 'deck' ({card_idx: count}) and 'steps' (per-step info).
@@ -821,7 +912,7 @@ class MTGDeckModel(nn.Module):
 
         return self.decoder(
             arch_emb, card_emb, self.basic_land_mask, greedy, target_deck,
-            curriculum_mask,
+            curriculum_mask, target_order, teacher_forcing_rate, temperature,
         )
 
     def forward_with_embeddings(
@@ -831,6 +922,9 @@ class MTGDeckModel(nn.Module):
         greedy: bool = False,
         target_deck: dict[int, int] | None = None,
         curriculum_mask: torch.Tensor | None = None,
+        target_order: list[int] | None = None,
+        teacher_forcing_rate: float = 1.0,
+        temperature: float = 1.0,
     ) -> dict:
         """Run deck construction using pre-computed GNN embeddings.
 
@@ -845,6 +939,9 @@ class MTGDeckModel(nn.Module):
             target_deck: {card_idx: count} ground truth for teacher forcing.
             curriculum_mask: (n_cards,) bool — curriculum eligibility mask
                 (see DeckConstructor.forward). None = all cards eligible.
+            target_order: deterministic card ordering for context correction.
+            teacher_forcing_rate: scheduled sampling rate (1.0 = always sub).
+            temperature: softmax temperature for card scorer.
 
         Returns:
             dict with 'deck' ({card_idx: count}) and 'steps' (per-step info).
@@ -854,7 +951,7 @@ class MTGDeckModel(nn.Module):
 
         return self.decoder(
             arch_emb, card_emb, self.basic_land_mask, greedy, target_deck,
-            curriculum_mask,
+            curriculum_mask, target_order, teacher_forcing_rate, temperature,
         )
 
     @torch.no_grad()
