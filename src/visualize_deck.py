@@ -416,6 +416,14 @@ def main(run_dir=None, fold_idx=0):
     node_dims = {nt: data[nt].x.shape[1] for nt in data.node_types}
     card_names = data["card"].names
 
+    # Extract card metadata for budget signal if the model was trained with it
+    card_color_flags = None
+    card_type_flags = None
+    if hp.get("budget_signal", False):
+        emb_dim = 384
+        card_type_flags = data["card"].x[:, emb_dim + 1 : emb_dim + 8].clone()
+        card_color_flags = data["card"].x[:, emb_dim + 10 : emb_dim + 15].clone()
+
     model = MTGDeckModel(
         node_dims=node_dims,
         edge_types=list(data.edge_types),
@@ -426,6 +434,8 @@ def main(run_dir=None, fold_idx=0):
         d_count=hp.get("d_count", 16),
         num_gnn_layers=hp.get("num_gnn_layers", 2),
         dropout=0.0,  # no dropout at inference
+        card_color_flags=card_color_flags,
+        card_type_flags=card_type_flags,
     )
 
     model.load_state_dict(checkpoint["model_state_dict"])
