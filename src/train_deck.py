@@ -281,20 +281,39 @@ def _build_target_order(
     ground_truth: dict[int, dict[int, int]],
     inclusion_rates: dict[int, dict[int, float]],
     card_names: list[str],
+    land_card_indices: set[int] | None = None,
 ) -> dict[int, list[int]]:
     """Sort each archetype's target cards for deterministic decoding.
 
-    Ordering: highest inclusion rate first, then copy count descending,
-    then card name ascending (alphabetical tiebreaker). The model learns
-    to lock in staples early and fill flex slots later.
+    Ordering: non-land spells first (by inclusion desc, count desc, name
+    asc), then lands second (same sub-ordering). This ensures the model
+    locks in the spells that define the archetype before filling land
+    slots. Within each group, high-consensus staples come first.
+
+    Args:
+        ground_truth: {arch_idx: {card_idx: count}}.
+        inclusion_rates: {arch_idx: {card_idx: float}}.
+        card_names: list of card names indexed by card_idx.
+        land_card_indices: set of card indices that are lands (basic or
+            non-basic). When None, only basic lands are pushed to the end.
     """
+    basic_indices = {
+        i for i, name in enumerate(card_names) if name in BASIC_LAND_NAMES
+    }
+
     target_orders: dict[int, list[int]] = {}
     for a_idx, cards in ground_truth.items():
         inc = inclusion_rates.get(a_idx, {})
-        order = sorted(
-            cards.keys(),
-            key=lambda c: (-inc.get(c, 1.0), -cards[c], card_names[c]),
-        )
+
+        def sort_key(c):
+            # is_land: 0 for non-lands (first), 1 for lands (last)
+            if land_card_indices is not None:
+                is_land = 1 if c in land_card_indices else 0
+            else:
+                is_land = 1 if c in basic_indices else 0
+            return (is_land, -inc.get(c, 1.0), -cards[c], card_names[c])
+
+        order = sorted(cards.keys(), key=sort_key)
         target_orders[a_idx] = order
     return target_orders
 
@@ -848,23 +867,34 @@ def train_deck(device=None, trial=None, **overrides):
     else:
         log.info(f"  Training on all {len(ground_truth)} archetypes with ground truth")
 
-    # ── Deterministic card ordering for context correction ──
-    card_names_pre = data["card"].names
-    target_orders = _build_target_order(ground_truth, inclusion_rates, card_names_pre)
-    log.info(f"  Built deterministic target orders for {len(target_orders)} archetypes")
-
-    # ── Extract card metadata for budget signal ���─
+    # ── Extract card metadata for budget signal, land detection ���─
     card_color_flags = None
     card_type_flags = None
+    card_names_pre = data["card"].names
+    emb_dim = 384
+    card_x = data["card"].x
+    # Scalar feature layout after embedding: cmc_norm(0), is_creature(1)..is_artifact(7),
+    # is_battle(8), rarity_enc(9), is_white(10)..is_green(14), is_colorless(15), ...
+
+    # Identify all land cards (is_land at offset 4) — used to push lands
+    # to the end of the target ordering so the model learns spells first.
+    is_land_flags = card_x[:, emb_dim + 4]
+    land_card_indices = {i for i in range(card_x.shape[0]) if is_land_flags[i] > 0.5}
+    log.info(f"  Detected {len(land_card_indices)} land cards "
+             f"(will be ordered last in target sequences)")
+
     if hp["budget_signal"]:
-        emb_dim = 384
-        card_x = data["card"].x
-        # Scalar feature layout after embedding: cmc_norm(0), is_creature(1)..is_artifact(7),
-        # is_battle(8), rarity_enc(9), is_white(10)..is_green(14), is_colorless(15), ...
         card_type_flags = card_x[:, emb_dim + 1 : emb_dim + 8].clone()   # 7 type flags
         card_color_flags = card_x[:, emb_dim + 10 : emb_dim + 15].clone()  # 5 color flags (WUBRG)
         log.info(f"  Budget signal: extracted type ({card_type_flags.shape[1]}) "
                  f"and color ({card_color_flags.shape[1]}) flags for {card_x.shape[0]} cards")
+
+    # ── Deterministic card ordering for context correction ──
+    target_orders = _build_target_order(
+        ground_truth, inclusion_rates, card_names_pre,
+        land_card_indices=land_card_indices,
+    )
+    log.info(f"  Built deterministic target orders for {len(target_orders)} archetypes")
 
     # ── Move to device ──
     data = data.to(device)
