@@ -120,9 +120,15 @@ MAX_DECK_SIZE = int(os.getenv("MAX_DECK_SIZE", "60"))
 MAX_BASIC_LAND_COUNT = int(os.getenv("MAX_BASIC_LAND_COUNT", "20"))
 MAX_NONBASIC_COUNT = int(os.getenv("MAX_NONBASIC_COUNT", "4"))
 
-# Training hyperparameters
-DECK_LEARNING_RATE = float(os.getenv("DECK_LEARNING_RATE", "0.0001"))
-GNN_LR_SCALE = float(os.getenv("GNN_LR_SCALE", "0.1"))  # GNN LR = base LR * this
+# Training hyperparameters — three independent learning rates by functional pathway:
+#   GNN:      model.gnn (message passing embeddings)
+#   Selector: context_encoder + card_selector (card selection pathway)
+#   Count:    count heads + count_embedding + context_merge (count prediction pathway)
+DECK_LEARNING_RATE = float(os.getenv("DECK_LEARNING_RATE", "0.0001"))      # selector LR (legacy alias)
+GNN_LEARNING_RATE = float(os.getenv("GNN_LEARNING_RATE", "0.00001"))       # GNN LR
+SELECTOR_LEARNING_RATE = float(os.getenv("SELECTOR_LEARNING_RATE", "0.0001"))  # card selector LR
+COUNT_LEARNING_RATE = float(os.getenv("COUNT_LEARNING_RATE", "0.0001"))    # count prediction LR
+GNN_LR_SCALE = float(os.getenv("GNN_LR_SCALE", "0.1"))  # legacy: GNN LR = base LR * this (ignored when GNN_LEARNING_RATE is set explicitly)
 WEIGHT_DECAY = float(os.getenv("WEIGHT_DECAY", "0.00001"))
 DECK_NUM_EPOCHS = int(os.getenv("DECK_NUM_EPOCHS", "50"))
 DECK_PATIENCE = int(os.getenv("DECK_PATIENCE", "10"))

@@ -46,7 +46,10 @@ from src.config import (
     DROPOUT,
     METAGAME_PARQUET,
     EDGE_CHUNK_SIZE,
+    COUNT_LEARNING_RATE,
+    GNN_LEARNING_RATE,
     GNN_LR_SCALE,
+    SELECTOR_LEARNING_RATE,
     DECK_NUM_CV_FOLDS,
     DECK_NUM_EPOCHS,
     DECK_NUM_VAL_ARCHETYPES,
@@ -745,6 +748,9 @@ def train_deck(device=None, trial=None, **overrides):
         "num_gnn_layers": overrides.get("num_gnn_layers", NUM_GNN_LAYERS),
         "dropout": overrides.get("dropout", DROPOUT),
         "learning_rate": overrides.get("learning_rate", DECK_LEARNING_RATE),
+        "gnn_learning_rate": overrides.get("gnn_learning_rate", GNN_LEARNING_RATE),
+        "selector_learning_rate": overrides.get("selector_learning_rate", SELECTOR_LEARNING_RATE),
+        "count_learning_rate": overrides.get("count_learning_rate", COUNT_LEARNING_RATE),
         "weight_decay": overrides.get("weight_decay", WEIGHT_DECAY),
         "num_epochs": overrides.get("num_epochs", DECK_NUM_EPOCHS),
         "patience": overrides.get("patience", DECK_PATIENCE),
@@ -953,15 +959,30 @@ def train_deck(device=None, trial=None, **overrides):
             total_params = sum(p.numel() for p in model.parameters())
             log.info(f"Model parameters: {total_params:,}")
 
-        # Differential learning rates: GNN backbone gets scaled LR
+        # Three-group learning rates by functional pathway:
+        #   GNN:      model.gnn (message passing embeddings)
+        #   Selector: context_encoder + card_selector (card selection pathway)
+        #   Count:    count heads + count_embedding + context_merge (count prediction)
         gnn_params = list(model.gnn.parameters())
         gnn_param_ids = {id(p) for p in gnn_params}
-        decoder_params = [p for p in model.parameters() if id(p) not in gnn_param_ids]
 
-        base_lr = hp["learning_rate"]
-        if mode == "finetune":
-            base_lr *= TRANSFER_FINETUNE_LR_SCALE
-        gnn_lr = base_lr * hp["gnn_lr_scale"]
+        selector_modules = [model.decoder.context_encoder, model.decoder.card_selector]
+        selector_params = []
+        selector_param_ids = set()
+        for mod in selector_modules:
+            for p in mod.parameters():
+                selector_params.append(p)
+                selector_param_ids.add(id(p))
+
+        count_params = [
+            p for p in model.decoder.parameters()
+            if id(p) not in selector_param_ids
+        ]
+
+        finetune_scale = TRANSFER_FINETUNE_LR_SCALE if mode == "finetune" else 1.0
+        gnn_lr = hp["gnn_learning_rate"] * finetune_scale
+        selector_lr = hp["selector_learning_rate"] * finetune_scale
+        count_lr = hp["count_learning_rate"] * finetune_scale
 
         # In finetune mode, optionally freeze GNN for first N epochs
         gnn_freeze_epochs = TRANSFER_GNN_FREEZE_EPOCHS if mode == "finetune" else 0
@@ -973,12 +994,13 @@ def train_deck(device=None, trial=None, **overrides):
         optimizer = torch.optim.AdamW(
             [
                 {"params": gnn_params, "lr": gnn_lr},
-                {"params": decoder_params, "lr": base_lr},
+                {"params": selector_params, "lr": selector_lr},
+                {"params": count_params, "lr": count_lr},
             ],
             weight_decay=hp["weight_decay"],
         )
         if fold_i == 0:
-            log.info(f"LR: GNN={gnn_lr:.1e} (scale={hp['gnn_lr_scale']}), Decoder={base_lr:.1e}"
+            log.info(f"LR: GNN={gnn_lr:.1e}, Selector={selector_lr:.1e}, Count={count_lr:.1e}"
                      f"{' [finetune]' if mode == 'finetune' else ''}")
 
         # ── LR scheduler ──
