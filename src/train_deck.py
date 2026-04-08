@@ -470,6 +470,8 @@ def evaluate_fold(
     data,
     ground_truth: dict[int, dict[int, int]],
     val_archetypes: list[int],
+    format_legality_masks: dict[str, torch.Tensor] | None = None,
+    arch_format_map: dict[int, str] | None = None,
 ) -> dict:
     """Evaluate model on held-out archetypes via greedy decoding.
 
@@ -500,8 +502,15 @@ def evaluate_fold(
         if not gt:
             continue
 
+        # Apply format legality mask if available
+        legality_mask = None
+        if format_legality_masks and arch_format_map:
+            fmt = arch_format_map.get(a_idx, "")
+            legality_mask = format_legality_masks.get(fmt)
+
         with torch.amp.autocast("cuda", enabled=use_amp):
-            pred = model.predict_deck(data, a_idx, x_dict=x_dict)
+            pred = model.predict_deck(data, a_idx, x_dict=x_dict,
+                                      legality_mask=legality_mask)
         n_evaluated += 1
         gt_set = set(gt.keys())
         pred_set = set(pred.keys())
@@ -925,10 +934,46 @@ def train_deck(device=None, trial=None, **overrides):
     )
     log.info(f"  Built deterministic target orders for {len(target_orders)} archetypes")
 
+    # ── Build per-format legality masks ──
+    # Cards legal in a format get True; the decoder uses this to restrict
+    # card selection to format-legal cards for each archetype.
+    cards_df = pd.read_parquet(_cfg.CARDS_PARQUET)
+    card_to_idx_pre = {name: i for i, name in enumerate(card_names_pre)}
+    for name, idx in list(card_to_idx_pre.items()):
+        if " // " in name:
+            card_to_idx_pre.setdefault(name.split(" // ")[0], idx)
+
+    format_legality_masks: dict[str, torch.Tensor] = {}
+    for fmt in ACTIVE_FORMATS:
+        col = f"legal_{fmt}"
+        if col not in cards_df.columns:
+            log.warning(f"  No legality column '{col}' in cards.parquet — "
+                        f"skipping format mask for {fmt}")
+            continue
+        mask = torch.zeros(n_total_cards, dtype=torch.bool)
+        n_legal = 0
+        for _, row in cards_df.iterrows():
+            name = row["name"]
+            if name in card_to_idx_pre and row[col]:
+                mask[card_to_idx_pre[name]] = True
+                n_legal += 1
+        format_legality_masks[fmt] = mask
+        log.info(f"  Format legality: {fmt} = {n_legal}/{n_total_cards} cards legal")
+
+    # Map archetype index → format string (from "format::Name" prefix)
+    arch_names_pre = data["archetype"].names
+    arch_format_map: dict[int, str] = {}
+    for a_idx in ground_truth:
+        name = arch_names_pre[a_idx]
+        fmt = name.split("::")[0] if "::" in name else ""
+        arch_format_map[a_idx] = fmt
+
     # ── Move to device ──
     data = data.to(device)
     card_names = data["card"].names
     arch_names = data["archetype"].names
+    for fmt in format_legality_masks:
+        format_legality_masks[fmt] = format_legality_masks[fmt].to(device)
     if card_color_flags is not None:
         card_color_flags = card_color_flags.to(device)
         card_type_flags = card_type_flags.to(device)
@@ -1202,10 +1247,18 @@ def train_deck(device=None, trial=None, **overrides):
                 for a_idx in batch_archs:
                     gt = ground_truth[a_idx]
 
+                    # Combine curriculum mask with format legality mask
+                    arch_fmt = arch_format_map.get(a_idx, "")
+                    fmt_mask = format_legality_masks.get(arch_fmt)
+                    if fmt_mask is not None:
+                        combined_mask = curriculum_mask & fmt_mask
+                    else:
+                        combined_mask = curriculum_mask
+
                     with torch.amp.autocast("cuda", enabled=use_amp):
                         result = model.forward_with_embeddings(
                             x_dict_d, a_idx, greedy=False, target_deck=gt,
-                            curriculum_mask=curriculum_mask,
+                            curriculum_mask=combined_mask,
                             target_order=target_orders.get(a_idx),
                             teacher_forcing_rate=tf_rate,
                             temperature=temperature,
@@ -1272,7 +1325,11 @@ def train_deck(device=None, trial=None, **overrides):
             do_val = (epoch % val_every == 0 or epoch == 1)
 
             if do_val:
-                val_metrics = evaluate_fold(model, data, ground_truth, val_archs)
+                val_metrics = evaluate_fold(
+                    model, data, ground_truth, val_archs,
+                    format_legality_masks=format_legality_masks,
+                    arch_format_map=arch_format_map,
+                )
                 val_metrics_history.append({"epoch": epoch, **val_metrics})
 
                 log.info(

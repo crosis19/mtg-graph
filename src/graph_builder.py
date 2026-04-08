@@ -69,13 +69,14 @@ def _load_cards() -> tuple[pd.DataFrame, dict, torch.Tensor]:
     """Load card data and build card node features.
 
     Returns (cards_df, card_name_to_idx, card_features_tensor).
-    Card features: [384-dim embedding + 23 scalar].
+    Card features: [384-dim embedding + N scalar].
 
-    Scalar features (23):
+    Scalar features:
       cmc_norm, is_creature, is_instant, is_sorcery, is_land, is_planeswalker,
       is_enchantment, is_artifact, is_battle, rarity_enc,
       is_white, is_blue, is_black, is_red, is_green, is_colorless,
-      gen_white, gen_blue, gen_black, gen_red, gen_green, gen_colorless
+      gen_white, gen_blue, gen_black, gen_red, gen_green, gen_colorless,
+      legal_standard, legal_pioneer, ... (per-format legality flags)
     """
     cards = pd.read_parquet(CARDS_PARQUET)
 
@@ -103,6 +104,9 @@ def _load_cards() -> tuple[pd.DataFrame, dict, torch.Tensor]:
     n_cards = len(cards)
     emb_dim = embeddings.shape[1]
 
+    # Per-format legality flags (added dynamically from cards.parquet columns)
+    legality_cols = sorted(c for c in cards.columns if c.startswith("legal_"))
+
     numeric_cols = [
         "cmc_norm",
         "is_creature", "is_instant", "is_sorcery", "is_land",
@@ -110,7 +114,7 @@ def _load_cards() -> tuple[pd.DataFrame, dict, torch.Tensor]:
         "rarity_enc",
         "is_white", "is_blue", "is_black", "is_red", "is_green", "is_colorless",
         "gen_white", "gen_blue", "gen_black", "gen_red", "gen_green", "gen_colorless",
-    ]
+    ] + legality_cols
 
     # Verify all columns exist
     missing = [c for c in numeric_cols if c not in cards.columns]

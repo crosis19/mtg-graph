@@ -243,6 +243,8 @@ def normalize(df: pd.DataFrame) -> pd.DataFrame:
         "is_white", "is_blue", "is_black", "is_red", "is_green", "is_colorless",
         "gen_white", "gen_blue", "gen_black", "gen_red", "gen_green", "gen_colorless",
     ]
+    # Include per-format legality flags (legal_standard, legal_pioneer, etc.)
+    bool_cols += [c for c in df.columns if c.startswith("legal_")]
     for col in bool_cols:
         df[col] = df[col].astype(float)
 

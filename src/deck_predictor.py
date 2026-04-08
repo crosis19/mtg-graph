@@ -960,6 +960,7 @@ class MTGDeckModel(nn.Module):
         data: HeteroData,
         archetype_idx: int,
         x_dict: dict[str, torch.Tensor] | None = None,
+        legality_mask: torch.Tensor | None = None,
     ) -> dict[int, int]:
         """Convenience method for greedy inference.
 
@@ -968,6 +969,8 @@ class MTGDeckModel(nn.Module):
             archetype_idx: which archetype to build a deck for.
             x_dict: optional pre-computed GNN embeddings. If provided,
                 skips the GNN forward pass.
+            legality_mask: optional (n_cards,) bool — format legality mask.
+                Only format-legal cards are eligible for selection.
 
         Returns:
             {card_idx: count} — a valid 60-card decklist.
@@ -976,7 +979,11 @@ class MTGDeckModel(nn.Module):
         if x_dict is not None:
             result = self.forward_with_embeddings(
                 x_dict, archetype_idx, greedy=True,
+                curriculum_mask=legality_mask,
             )
         else:
-            result = self.forward(data, archetype_idx, greedy=True)
+            result = self.forward(
+                data, archetype_idx, greedy=True,
+                curriculum_mask=legality_mask,
+            )
         return result["deck"]
