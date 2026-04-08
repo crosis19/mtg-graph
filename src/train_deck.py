@@ -332,6 +332,7 @@ def compute_step_losses(
     count_loss_weight: float,
     inclusion_rates: dict[int, float] | None = None,
     consensus_min_weight: float = 0.2,
+    land_card_indices: set[int] | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """Compute per-step card selection and count prediction losses.
 
@@ -345,7 +346,9 @@ def compute_step_losses(
 
     When *inclusion_rates* is provided, correct-card losses are weighted
     by the card's consensus rate (clamped to *consensus_min_weight*).
-    Staples get weight ~1.0; flex slots get the floor weight.
+    Staples get weight ~1.0; flex slots get the floor weight. Land cards
+    are capped at *consensus_min_weight* regardless of their inclusion
+    rate, so the model prioritizes getting spells right over lands.
 
     Args:
         steps: per-step dicts from DeckConstructor.forward().
@@ -353,6 +356,8 @@ def compute_step_losses(
         count_loss_weight: lambda weighting for count loss.
         inclusion_rates: optional {card_idx: float} consensus rates.
         consensus_min_weight: floor weight for low-inclusion cards.
+        land_card_indices: set of card indices that are lands. When
+            provided, land consensus weights are capped at min_weight.
 
     Returns:
         (total_loss, metrics_dict)
@@ -375,9 +380,14 @@ def compute_step_losses(
             prob = select_probs[card_idx].clamp(min=1e-10)
             step_select_loss = -torch.log(prob)
 
-            # Consensus weighting: penalize missing staples more heavily
+            # Consensus weighting: penalize missing staples more heavily.
+            # Lands are capped at min_weight so the model prioritizes spells.
             if inclusion_rates is not None:
-                cw = max(inclusion_rates.get(card_idx, 1.0), consensus_min_weight)
+                is_land = land_card_indices is not None and card_idx in land_card_indices
+                if is_land:
+                    cw = consensus_min_weight
+                else:
+                    cw = max(inclusion_rates.get(card_idx, 1.0), consensus_min_weight)
                 step_select_loss = step_select_loss * cw
 
             total_select_loss = total_select_loss + step_select_loss
@@ -397,7 +407,11 @@ def compute_step_losses(
                     # Use only valid positions for cross-entropy
                     ce = F.cross_entropy(count_logits.unsqueeze(0), target_tensor.unsqueeze(0))
                     if inclusion_rates is not None:
-                        cw = max(inclusion_rates.get(card_idx, 1.0), consensus_min_weight)
+                        is_land = land_card_indices is not None and card_idx in land_card_indices
+                        if is_land:
+                            cw = consensus_min_weight
+                        else:
+                            cw = max(inclusion_rates.get(card_idx, 1.0), consensus_min_weight)
                         ce = ce * cw
                     total_count_loss = total_count_loss + ce
                     n_count += 1
@@ -1191,6 +1205,7 @@ def train_deck(device=None, trial=None, **overrides):
                             result["steps"], gt, hp["count_loss_weight"],
                             inclusion_rates=inclusion_rates.get(a_idx) if hp["consensus_loss_weighting"] else None,
                             consensus_min_weight=hp["consensus_loss_min_weight"],
+                            land_card_indices=land_card_indices,
                         )
 
                     # Decoder backward — grads accumulate in x_dict_d[nt].grad
