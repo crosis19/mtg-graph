@@ -182,12 +182,21 @@ def _build_ground_truth(
         inc = float(row["inclusion_pct"]) if has_inclusion else 1.0
         inclusion_rates.setdefault(a_idx, {})[c_idx] = inc
 
-    # Log summary
+    # Filter out archetypes whose total copies != MAX_DECK_SIZE (e.g., 80-card
+    # Yorion companion decks). The model is built around the 60-card budget.
+    filtered_gt: dict[int, dict[int, int]] = {}
+    filtered_inc: dict[int, dict[int, float]] = {}
     for a_idx, cards in ground_truth.items():
         total = sum(cards.values())
+        if total != MAX_DECK_SIZE:
+            log.warning(f"  Dropping {arch_names[a_idx]}: {total} total copies "
+                        f"(expected {MAX_DECK_SIZE}) — likely a companion deck")
+            continue
+        filtered_gt[a_idx] = cards
+        filtered_inc[a_idx] = inclusion_rates.get(a_idx, {})
         log.info(f"  Archetype {arch_names[a_idx]}: {len(cards)} unique cards, {total} total copies")
 
-    return ground_truth, inclusion_rates
+    return filtered_gt, filtered_inc
 
 
 # ════════════════════════════════════════════════════════════════════
