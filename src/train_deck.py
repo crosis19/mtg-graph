@@ -417,7 +417,7 @@ def compute_step_losses(
                     else:
                         spell_progress = 1.0
                     full_weight = max(inclusion_rates.get(card_idx, 1.0), consensus_min_weight)
-                    cw = consensus_min_weight + (full_weight - consensus_min_weight) * spell_progress
+                    cw = full_weight * spell_progress
                 else:
                     cw = max(inclusion_rates.get(card_idx, 1.0), consensus_min_weight)
                 step_select_loss = step_select_loss * cw
@@ -446,7 +446,7 @@ def compute_step_losses(
                             else:
                                 spell_progress = 1.0
                             full_weight = max(inclusion_rates.get(card_idx, 1.0), consensus_min_weight)
-                            cw = consensus_min_weight + (full_weight - consensus_min_weight) * spell_progress
+                            cw = full_weight * spell_progress
                         else:
                             cw = max(inclusion_rates.get(card_idx, 1.0), consensus_min_weight)
                         ce = ce * cw
