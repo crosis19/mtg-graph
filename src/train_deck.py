@@ -405,19 +405,20 @@ def compute_step_losses(
             step_select_loss = -torch.log(prob)
 
             # Consensus weighting: penalize missing staples more heavily.
-            # Lands use progressive weighting: near 0 early, full late.
+            # Lands use progressive weighting: small floor early, full late.
+            _LAND_WEIGHT_FLOOR = 0.05
             if inclusion_rates is not None:
                 is_land = land_card_indices is not None and card_idx in land_card_indices
                 if is_land:
-                    # Progressive: weight scales from ~0 to full as spells
-                    # are consumed. spell_progress=0 (no spells picked) → near 0;
-                    # spell_progress=1 (all spells picked) → full inclusion rate.
+                    # Progressive: weight scales from floor to full as spells
+                    # are consumed. Floor gives enough gradient for color matching;
+                    # full weight kicks in once spells are locked in.
                     if total_spell_targets > 0:
                         spell_progress = 1.0 - (spells_remaining / total_spell_targets)
                     else:
                         spell_progress = 1.0
                     full_weight = max(inclusion_rates.get(card_idx, 1.0), consensus_min_weight)
-                    cw = full_weight * spell_progress
+                    cw = _LAND_WEIGHT_FLOOR + full_weight * spell_progress
                 else:
                     cw = max(inclusion_rates.get(card_idx, 1.0), consensus_min_weight)
                 step_select_loss = step_select_loss * cw
@@ -446,7 +447,7 @@ def compute_step_losses(
                             else:
                                 spell_progress = 1.0
                             full_weight = max(inclusion_rates.get(card_idx, 1.0), consensus_min_weight)
-                            cw = full_weight * spell_progress
+                            cw = _LAND_WEIGHT_FLOOR + full_weight * spell_progress
                         else:
                             cw = max(inclusion_rates.get(card_idx, 1.0), consensus_min_weight)
                         ce = ce * cw
