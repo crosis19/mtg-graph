@@ -13,9 +13,17 @@ import json
 import logging
 from pathlib import Path
 
+import pandas as pd
 import torch
 
-from src.config import GRAPH_PATH, MAX_BASIC_LAND_COUNT, MAX_NONBASIC_COUNT, RESULTS_DIR
+from src.config import (
+    ACTIVE_FORMATS,
+    CARDS_PARQUET,
+    GRAPH_PATH,
+    MAX_BASIC_LAND_COUNT,
+    MAX_NONBASIC_COUNT,
+    RESULTS_DIR,
+)
 from src.deck_predictor import MTGDeckModel
 from src.graph_builder import BASIC_LAND_NAMES
 
@@ -23,10 +31,45 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger(__name__)
 
 
-def _get_deck_predictions(data, model) -> dict:
-    """Run greedy inference for each archetype and return predictions + actuals."""
+def _build_format_legality_masks(
+    card_names: list[str],
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """Build per-format legality masks from cards.parquet."""
+    cards_df = pd.read_parquet(CARDS_PARQUET)
+    card_to_idx = {name: i for i, name in enumerate(card_names)}
+    for name, idx in list(card_to_idx.items()):
+        if " // " in name:
+            card_to_idx.setdefault(name.split(" // ")[0], idx)
+
+    masks: dict[str, torch.Tensor] = {}
+    for fmt in ACTIVE_FORMATS:
+        col = f"legal_{fmt}"
+        if col not in cards_df.columns:
+            continue
+        mask = torch.zeros(len(card_names), dtype=torch.bool, device=device)
+        for _, row in cards_df.iterrows():
+            name = row["name"]
+            if name in card_to_idx and row[col]:
+                mask[card_to_idx[name]] = True
+        masks[fmt] = mask
+    return masks
+
+
+def _get_deck_predictions(
+    data,
+    model,
+    format_legality_masks: dict[str, torch.Tensor] | None = None,
+) -> dict:
+    """Run greedy inference for each archetype and return predictions + actuals.
+
+    Caches GNN embeddings and applies format legality masks for ~5-10x
+    speedup over the naive per-archetype approach.
+    """
     arch_names = data["archetype"].names
     card_names = data["card"].names
+    device = next(model.parameters()).device
+    use_amp = device.type == "cuda"
 
     # Build ground truth from contains edges
     arch_actual: dict[int, dict[str, int]] = {}
@@ -49,11 +92,26 @@ def _get_deck_predictions(data, model) -> dict:
             count = max(1, count)
             arch_actual.setdefault(a_idx, {})[card] = count
 
+    # Cache GNN embeddings once for all archetypes
+    model.eval()
+    with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_amp):
+        x_dict = model.gnn(data)
+
     results = {}
     n_archetypes = len(arch_names)
     for a_idx, arch_name in enumerate(arch_names):
         log.info(f"  Predicting deck {a_idx + 1}/{n_archetypes}: {arch_name}")
-        pred_raw = model.predict_deck(data, a_idx)
+
+        # Apply format legality mask based on archetype name prefix
+        legality_mask = None
+        if format_legality_masks:
+            fmt = arch_name.split("::")[0] if "::" in arch_name else ""
+            legality_mask = format_legality_masks.get(fmt)
+
+        with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_amp):
+            pred_raw = model.predict_deck(
+                data, a_idx, x_dict=x_dict, legality_mask=legality_mask,
+            )
         actual = arch_actual.get(a_idx, {})
         actual_set = set(actual.keys())
 
@@ -402,11 +460,12 @@ def main(run_dir=None, fold_idx=0):
 
     # Load graph and model
     log.info("Loading graph and model...")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     data = torch.load(GRAPH_PATH, weights_only=False)
     hp = training_log.get("hyperparameters", {})
 
     # Load checkpoint (contains hyperparameters)
-    checkpoint = torch.load(model_path, weights_only=False)
+    checkpoint = torch.load(model_path, weights_only=False, map_location=device)
     ckpt_hp = checkpoint.get("hyperparameters", {})
     # Prefer checkpoint HPs over training log HPs
     for k, v in ckpt_hp.items():
@@ -440,8 +499,17 @@ def main(run_dir=None, fold_idx=0):
 
     model.load_state_dict(checkpoint["model_state_dict"])
 
+    # Move to GPU for faster inference
+    data = data.to(device)
+    model = model.to(device)
+    model.eval()
+
+    # Build format legality masks
+    format_legality_masks = _build_format_legality_masks(card_names, device)
+    log.info(f"  Format legality masks: {', '.join(f'{f}={int(m.sum())}' for f, m in format_legality_masks.items())}")
+
     log.info(f"Generating predictions for {len(data['archetype'].names)} archetypes...")
-    deck_predictions = _get_deck_predictions(data, model)
+    deck_predictions = _get_deck_predictions(data, model, format_legality_masks)
 
     log.info("Building HTML dashboard...")
     html = generate_deck_html(training_log, deck_predictions)

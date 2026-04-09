@@ -355,9 +355,12 @@ def compute_step_losses(
 
     When *inclusion_rates* is provided, correct-card losses are weighted
     by the card's consensus rate (clamped to *consensus_min_weight*).
-    Staples get weight ~1.0; flex slots get the floor weight. Land cards
-    are capped at *consensus_min_weight* regardless of their inclusion
-    rate, so the model prioritizes getting spells right over lands.
+    Staples get weight ~1.0; flex slots get the floor weight.
+
+    Land cards use **progressive weighting**: their consensus weight
+    scales from near 0 (when most target spells remain) to full
+    inclusion rate (when most target spells have been picked). This
+    teaches the model to prioritize spells early and fill lands late.
 
     Args:
         steps: per-step dicts from DeckConstructor.forward().
@@ -366,7 +369,8 @@ def compute_step_losses(
         inclusion_rates: optional {card_idx: float} consensus rates.
         consensus_min_weight: floor weight for low-inclusion cards.
         land_card_indices: set of card indices that are lands. When
-            provided, land consensus weights are capped at min_weight.
+            provided, land consensus weights scale progressively with
+            how many non-land target cards have been consumed.
 
     Returns:
         (total_loss, metrics_dict)
@@ -377,6 +381,17 @@ def compute_step_losses(
     n_select = 0
     n_count = 0
     n_correct_cards = 0
+
+    # Progressive land weighting: track how many non-land target cards
+    # remain so land weight can scale from ~0 to full as spells are consumed.
+    if land_card_indices is not None:
+        total_spell_targets = sum(
+            1 for c in target_deck if c not in land_card_indices
+        )
+        spells_remaining = total_spell_targets
+    else:
+        total_spell_targets = 0
+        spells_remaining = 0
 
     for step in steps:
         card_idx = step["card_idx"]
@@ -390,11 +405,19 @@ def compute_step_losses(
             step_select_loss = -torch.log(prob)
 
             # Consensus weighting: penalize missing staples more heavily.
-            # Lands are capped at min_weight so the model prioritizes spells.
+            # Lands use progressive weighting: near 0 early, full late.
             if inclusion_rates is not None:
                 is_land = land_card_indices is not None and card_idx in land_card_indices
                 if is_land:
-                    cw = consensus_min_weight
+                    # Progressive: weight scales from ~0 to full as spells
+                    # are consumed. spell_progress=0 (no spells picked) → near 0;
+                    # spell_progress=1 (all spells picked) → full inclusion rate.
+                    if total_spell_targets > 0:
+                        spell_progress = 1.0 - (spells_remaining / total_spell_targets)
+                    else:
+                        spell_progress = 1.0
+                    full_weight = max(inclusion_rates.get(card_idx, 1.0), consensus_min_weight)
+                    cw = consensus_min_weight + (full_weight - consensus_min_weight) * spell_progress
                 else:
                     cw = max(inclusion_rates.get(card_idx, 1.0), consensus_min_weight)
                 step_select_loss = step_select_loss * cw
@@ -418,15 +441,22 @@ def compute_step_losses(
                     if inclusion_rates is not None:
                         is_land = land_card_indices is not None and card_idx in land_card_indices
                         if is_land:
-                            cw = consensus_min_weight
+                            if total_spell_targets > 0:
+                                spell_progress = 1.0 - (spells_remaining / total_spell_targets)
+                            else:
+                                spell_progress = 1.0
+                            full_weight = max(inclusion_rates.get(card_idx, 1.0), consensus_min_weight)
+                            cw = consensus_min_weight + (full_weight - consensus_min_weight) * spell_progress
                         else:
                             cw = max(inclusion_rates.get(card_idx, 1.0), consensus_min_weight)
                         ce = ce * cw
                     total_count_loss = total_count_loss + ce
                     n_count += 1
 
-            # Remove from remaining targets (card has been selected)
+            # Remove from remaining targets and update spell tracking
             del target_remaining[card_idx]
+            if land_card_indices is not None and card_idx not in land_card_indices:
+                spells_remaining -= 1
 
         else:
             # Wrong card — penalize by rewarding total prob on remaining targets
@@ -442,6 +472,8 @@ def compute_step_losses(
             # for failing to pick a card that is already selected/ineligible.
             sub_idx = step.get("substituted_card_idx")
             if sub_idx is not None and sub_idx in target_remaining:
+                if land_card_indices is not None and sub_idx not in land_card_indices:
+                    spells_remaining -= 1
                 del target_remaining[sub_idx]
 
     # Average losses
